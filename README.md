@@ -10,6 +10,19 @@ Shared vocabulary accounts. Phone and desktop are two cookie sessions of one acc
 - Review events are append-only. A practice review (`affectsSchedule: false`) is recorded and does not move the due date.
 - Manual add, versioned JSON export, and replace or merge restore. Optional `eqbank` fields are stored metadata only. This server does not call Eqbank.
 - Accounts use scrypt password hashes, HttpOnly session cookies, and CSRF tokens. Writes require an idempotency key and, for reviews, the schedule revision the client last saw.
+- One recognition schedule is shared by every sentence of one explicit sense. Sentences keep their own text. A new sense gets its own schedule.
+
+## Recognition schedules
+
+Extra sentences on a sense you already chose do not reset its review progress. Review shows one of those sentences. The index moves to the next sentence only when a recognition grade is newly saved. Practice, reload, and a repeated saved request do not move it. Other sentences, and every sentence translation, stay hidden until you reveal the card.
+
+A backup file is schema 2. It lists the recognition tasks, the shared schedules, the older per-card schedules, and which sentence is current. A schema 1 file can still be restored. The server turns it into the same recognition tasks. A backup does not include idempotency keys. Copying the file to another server does not replay or cancel requests that were already saved on the first server.
+
+Opening a version 1 or 2 SQLite file with this build migrates it to version 3 in one transaction. Back up that file first. The migration keeps every old per-card schedule and copies one whole schedule forward: the earliest due date, then the lowest card id. It does not add the old schedules together. A review still waiting in the outbox with an old per-card revision comes back as a conflict and stays in the outbox. Do not point this build at a database that another process already has open.
+
+Merging a backup accepts an existing recognition task only when the whole task snapshot matches. The shared schedule revision may differ after this server rebases it. Added sentences, a sentence already stored on that sense but missing from the backup, archived schedules, review history, or a different current sentence are refused, and that merge does not change the account. A repeated merge of the same snapshot does not move progress.
+
+Replacing a backup keeps the recognition revision floor. If a sense comes back with no card and you later add its first sentence, the new schedule starts one revision above that floor. A sense that never had a schedule still starts at revision 1.
 
 ## Run
 
@@ -22,7 +35,7 @@ npm test
 npm run build:web
 ```
 
-`npm test` compiles the API with `tsc` and runs `node --test --test-concurrency=1 dist/test/api.test.js dist/test/clientSync.test.js`. That includes the HTTP check that `Origin: http://127.0.0.1:5173` can use the explicit dev API policy. The test listens on an ephemeral port on `127.0.0.1`, so it does not need ports 8787 or 5173. One case renders the review translation component with `react-dom/server`. The suite does not open a browser. `npm run test:ui` is a separate script and is not part of `npm test`.
+`npm test` compiles the API with `tsc` and runs `node --test --test-concurrency=1 dist/test/api.test.js dist/test/clientSync.test.js dist/test/senseRecognition.test.js`. That includes the HTTP check that `Origin: http://127.0.0.1:5173` can use the explicit dev API policy. The test listens on an ephemeral port on `127.0.0.1`, so it does not need ports 8787 or 5173. One case renders the review translation component with `react-dom/server`. The suite does not open a browser. `npm run test:ui` is a separate script and is not part of `npm test`.
 
 `npm run build:web` typechecks and builds the client with Vite. It does not start a server.
 
@@ -40,6 +53,8 @@ npm run build:web
 ```
 
 The checkpoint before this workflow was 49 passing Node tests, then `npm run build:web`. That count is 49, not 47. The 49 tests include the HTTP checks and the `react-dom/server` component render. They are not automated browser tests. `npm run test:ui` is not in the workflow and has not been run. The Firefox notes under Manual browser QA are historical manual evidence.
+
+A later independent check of this tree used Node.js 24.21.0 and npm 11.19.0. `npm test` reported 76 tests, 15 suites, 0 failed, and 0 skipped. `npm run build:web` transformed 106 modules. That check is separate from the 49-test checkpoint above and is not a result from `.github/workflows/ci.yml`. `npm run test:ui` was not run. The Firefox notes for that check are under Later synthetic checks.
 
 `npm start` listens on `127.0.0.1:8787` and opens `data/wordloom.sqlite` when `HOST`, `PORT`, and `DATABASE_PATH` are unset. With `WORDLOOM_ALLOWED_ORIGINS` unset, a loopback listener accepts any loopback `http` or `https` origin (`127.0.0.1`, `localhost`, `::1`, any port). A non-loopback `HOST` is refused unless `WORDLOOM_PUBLIC_REVIEWED=1`. `NODE_ENV=production`, and any public listener, also require `WORDLOOM_SECURE_COOKIES=1` and a non-empty `WORDLOOM_ALLOWED_ORIGINS` list of exact `http` or `https` origins. Those checks stay in place for the Vite dev pair. A production deployment is not reviewed.
 
@@ -87,7 +102,15 @@ Auth and basic learning in that Firefox session: the desktop auth form at about 
 
 Node regressions are a separate run. That pass recorded `npm test` with 49 passing tests and `npm run build:web`. Those commands do not open a browser.
 
-Still unchecked in the browser: the `test:ui` script, a cross-account race on screen, backup restore in the UI, speech output, a review whose response body is lost after the server has committed it, and two independent devices.
+Unchecked in the browser after that pass: the `test:ui` script, a cross-account race on screen, backup restore in the UI, speech output, a review whose response body is lost after the server has committed it, and two independent devices.
+
+## Later synthetic checks
+
+The 76-test check above rereviewed backup export as one transaction and the refusal of a merge that would omit a sentence already stored on that sense. It reloaded the API from this build and repeated export and replace in Firefox on a disposable database. The original database was preserved.
+
+That Firefox pass used synthetic data. An existing sense with two sentences stayed one recognition task. The same spelling saved as a new sense stayed separate. A recognition grade moved the prompt from 1/2 to 2/2. At 390px, reveal and the grade choices were used. Stopping the API left a grade queued; after the API returned, the retry saved it and history showed that grade on that sentence. The library showed a schema 2 export, its preview, a merge that changed nothing, and replace with that same file. Cancel and Escape each cleared the replace confirmation. Opening replace again left the checkbox unchecked and the confirm button disabled.
+
+Still unchecked in the browser: the `test:ui` script, a cross-account race on screen, speech output, a review whose response body is lost after the server has committed it, and two independent devices.
 
 ## API
 
@@ -106,11 +129,11 @@ Still unchecked in the browser: the `test:ui` script, a cross-account race on sc
 | GET | `/api/cards/:id/events` | Append-only history |
 | GET | `/api/queue` | Due at or before the server clock |
 | GET | `/api/senses` | Senses with their sentences |
-| GET | `/api/backup` | Schema version 1 |
-| POST | `/api/backup/restore` | `replace` (confirm `"replace"`) or `merge` |
+| GET | `/api/backup` | Schema version 2 export |
+| POST | `/api/backup/restore` | Accepts schema 1 or 2. `replace` (confirm `"replace"`) or `merge` |
 
 Unsafe authenticated requests send `X-CSRF-Token` equal to `wl_csrf`. Card create, review, and restore also send `Idempotency-Key` (`8–80` letters, digits, `_`, or `-`) and `X-Wordloom-Owner` set to the account id that queued the write. Inside that write transaction the server re-reads the session and returns `409 OWNER_MISMATCH` when the header is a different account, or `400 VALIDATION` when the header is missing. The same key and body returns the first response with `Idempotency-Replayed: true`. The same key and a different body returns `409 IDEMPOTENCY_CONFLICT`. A review whose `expectedScheduleRevision` is stale returns `409 REVISION_CONFLICT`. A cookie change from a disallowed origin returns `403 ORIGIN_REJECTED` and sets no cookie. A rate-limited auth or CSRF setup call returns `429 RATE_LIMITED` with `Retry-After` and sets no cookie.
 
-Backup documents use `schemaVersion: 1`. A replace restore deletes that account's learning rows, keeps idempotency receipts, then inserts the snapshot. `progressRevision` becomes one greater than both the live revision and the snapshot revision. Each restored schedule keeps the snapshot's due time and FSRS fields, and its `revision` becomes one greater than the live schedule revision, the snapshot revision, and any revision that card already used. That floor survives deleting the card, so a later replace cannot revive a revision an uncommitted review still expects. Replaying a key whose write already committed does not apply it again, including after a later replace. Ids owned by another account are rejected before any delete. The client applies `GET /api/library` only when that snapshot's user is the account named by `X-Wordloom-Owner`.
+`GET /api/backup` exports `schemaVersion: 2`. The file lists recognition tasks, one shared schedule per task, the older per-card schedules, and which sentence is current. Restore accepts `schemaVersion: 1` or `schemaVersion: 2`. A version 1 file has one schedule per card, and the server turns it into the same recognition tasks. A replace restore deletes that account's learning rows, keeps idempotency receipts, and keeps the shared-task generation floor and the alias floors. The alias floors are the revision retained for each card that belonged to the task, and the binding that keeps that card on that task. The restore then inserts the snapshot. `progressRevision` becomes one greater than both the live revision and the snapshot revision. Each restored shared schedule keeps the snapshot's due time and FSRS fields. Its `revision` is set above the snapshot revision, the review revisions stored for that task, and those shared-task and alias floors. The floors survive deleting the card, so a later replace cannot revive a revision an uncommitted review still expects. A version 1 file does not carry those floors. A fresh server uses the revisions inside the file. A server that already has the floors applies them at insert. Replaying a key whose write already committed does not apply it again, including after a later replace. Ids owned by another account are rejected before any delete. The client applies `GET /api/library` only when that snapshot's user is the account named by `X-Wordloom-Owner`.
 
 Synthetic examples only. No dictionary corpus and no remote account service.

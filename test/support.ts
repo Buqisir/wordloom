@@ -38,9 +38,9 @@ export async function startApp(options?: {
   originPolicy?: OriginPolicy;
   authRateLimit?: RateLimit;
   csrfRateLimit?: RateLimit;
+  existingPath?: string;
 }): Promise<RunningApp> {
-  const dir = mkdtempSync(join(tmpdir(), 'wordloom-'));
-  const dbPath = join(dir, 'wordloom.sqlite');
+  const dbPath = options?.existingPath ?? join(mkdtempSync(join(tmpdir(), 'wordloom-')), 'wordloom.sqlite');
   const db: DatabaseSync = openDatabase(dbPath);
   const server: Server = createApp({
     db,

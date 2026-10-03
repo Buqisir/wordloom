@@ -1,16 +1,24 @@
 import { HttpError } from './errors.js';
 import { isGradeName, isStateName } from './scheduler.js';
+import { recognitionTaskId } from './senseTask.js';
 import {
   BACKUP_SCHEMA_VERSION,
+  LEGACY_BACKUP_SCHEMA_VERSION,
+  TASK_POLICY,
   type BackupDocument,
+  type BackupDocumentV1,
+  type BackupDocumentV2,
   type CardJson,
   type EqbankMeta,
   type GradeName,
+  type MemberJson,
   type OccurrenceJson,
   type ReviewEventJson,
+  type RotationJson,
   type ScheduleJson,
   type SenseJson,
   type StateName,
+  type TaskJson,
 } from './types.js';
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -185,44 +193,134 @@ export type ReviewRequest = {
   grade: GradeName;
   affectsSchedule: boolean;
   expectedScheduleRevision: number;
+  occurrenceId?: string;
 };
 
 export function parseReview(body: Record<string, unknown>): ReviewRequest {
-  assertOnlyKeys(body, ['grade', 'affectsSchedule', 'expectedScheduleRevision'], 'review');
+  rejectUnknown(body, ['grade', 'affectsSchedule', 'expectedScheduleRevision', 'occurrenceId'], 'review');
+  for (const key of ['grade', 'affectsSchedule', 'expectedScheduleRevision']) {
+    if (!(key in body)) {
+      throw new HttpError(400, 'VALIDATION', `review is missing ${key}.`);
+    }
+  }
   if (typeof body.grade !== 'string' || !isGradeName(body.grade)) {
     throw new HttpError(400, 'VALIDATION', 'grade must be again, hard, good, or easy.');
   }
-  return {
+  const review: ReviewRequest = {
     grade: body.grade,
     affectsSchedule: assertBoolean(body.affectsSchedule, 'affectsSchedule'),
     expectedScheduleRevision: assertInteger(body.expectedScheduleRevision, 'expectedScheduleRevision', 1),
   };
+  if (body.occurrenceId !== undefined) {
+    review.occurrenceId = assertUuid(body.occurrenceId, 'occurrenceId');
+  }
+  return review;
 }
 
 export function parseBackupDocument(value: unknown): BackupDocument {
   if (!isRecord(value)) {
     throw new HttpError(400, 'VALIDATION', 'document must be an object.');
   }
+  if (value.schemaVersion === LEGACY_BACKUP_SCHEMA_VERSION) {
+    return parseBackupV1(value);
+  }
+  if (value.schemaVersion === BACKUP_SCHEMA_VERSION) {
+    return parseBackupV2(value);
+  }
+  throw new HttpError(400, 'SCHEMA_UNSUPPORTED', `Backup schemaVersion must be ${LEGACY_BACKUP_SCHEMA_VERSION} or ${BACKUP_SCHEMA_VERSION}.`);
+}
+
+function parseBackupV1(value: Record<string, unknown>): BackupDocumentV1 {
   assertOnlyKeys(
     value,
     ['schemaVersion', 'exportedAt', 'progressRevision', 'senses', 'occurrences', 'cards', 'schedules', 'reviewEvents'],
     'document',
   );
-  if (value.schemaVersion !== BACKUP_SCHEMA_VERSION) {
-    throw new HttpError(400, 'SCHEMA_UNSUPPORTED', `Backup schemaVersion must be ${BACKUP_SCHEMA_VERSION}.`);
-  }
   const senses = parseArray(value.senses, 'senses', parseSense);
   const occurrences = parseArray(value.occurrences, 'occurrences', parseOccurrence);
   const cards = parseArray(value.cards, 'cards', parseCard);
-  const schedules = parseArray(value.schedules, 'schedules', parseSchedule);
-  const reviewEvents = parseArray(value.reviewEvents, 'reviewEvents', parseEvent);
+  const schedules = parseArray(value.schedules, 'schedules', (entry, index) => parseSchedule(entry, index));
+  const reviewEvents = parseArray(value.reviewEvents, 'reviewEvents', (entry, index) => parseEvent(entry, index, false)).map((event) => ({
+    ...event,
+    taskId: null,
+    occurrenceId: null,
+  }));
+  assertLearningGraph(senses, occurrences, cards, reviewEvents);
+  assertUnique(schedules.map((schedule) => schedule.cardId), 'schedule cardId');
+  const scheduled = new Set(schedules.map((schedule) => schedule.cardId));
+  const cardIds = new Set(cards.map((card) => card.id));
+  if (scheduled.size !== cardIds.size || [...cardIds].some((id) => !scheduled.has(id))) {
+    throw new HttpError(400, 'VALIDATION', 'Every card needs exactly one schedule.');
+  }
+  return {
+    schemaVersion: LEGACY_BACKUP_SCHEMA_VERSION,
+    exportedAt: assertIso(value.exportedAt, 'exportedAt'),
+    progressRevision: assertInteger(value.progressRevision, 'progressRevision', 0),
+    senses,
+    occurrences,
+    cards,
+    schedules,
+    reviewEvents,
+  };
+}
+
+function parseBackupV2(value: Record<string, unknown>): BackupDocumentV2 {
+  assertOnlyKeys(
+    value,
+    [
+      'schemaVersion',
+      'exportedAt',
+      'progressRevision',
+      'senses',
+      'occurrences',
+      'cards',
+      'schedules',
+      'reviewEvents',
+      'tasks',
+      'members',
+      'legacySchedules',
+      'rotations',
+    ],
+    'document',
+  );
+  const senses = parseArray(value.senses, 'senses', parseSense);
+  const occurrences = parseArray(value.occurrences, 'occurrences', parseOccurrence);
+  const cards = parseArray(value.cards, 'cards', parseCard);
+  const schedules = parseArray(value.schedules, 'schedules', (entry, index) => parseSchedule(entry, index));
+  const reviewEvents = parseArray(value.reviewEvents, 'reviewEvents', (entry, index) => parseEvent(entry, index, true));
+  const tasks = parseArray(value.tasks, 'tasks', parseTask);
+  const members = parseArray(value.members, 'members', parseMember);
+  const legacySchedules = parseArray(value.legacySchedules, 'legacySchedules', (entry, index) => parseSchedule(entry, index, 'legacySchedules'));
+  const rotations = parseArray(value.rotations, 'rotations', parseRotation);
+  assertLearningGraph(senses, occurrences, cards, reviewEvents);
+  assertRecognitionGraph(senses, occurrences, cards, schedules, reviewEvents, tasks, members, legacySchedules, rotations);
+  return {
+    schemaVersion: BACKUP_SCHEMA_VERSION,
+    exportedAt: assertIso(value.exportedAt, 'exportedAt'),
+    progressRevision: assertInteger(value.progressRevision, 'progressRevision', 0),
+    senses,
+    occurrences,
+    cards,
+    schedules,
+    reviewEvents,
+    tasks,
+    members,
+    legacySchedules,
+    rotations,
+  };
+}
+
+function assertLearningGraph(
+  senses: SenseJson[],
+  occurrences: OccurrenceJson[],
+  cards: CardJson[],
+  reviewEvents: ReviewEventJson[],
+): void {
   assertUnique(senses.map((sense) => sense.id), 'sense id');
   assertUnique(occurrences.map((occurrence) => occurrence.id), 'occurrence id');
   assertUnique(cards.map((card) => card.id), 'card id');
-  assertUnique(schedules.map((schedule) => schedule.cardId), 'schedule cardId');
   assertUnique(reviewEvents.map((event) => event.id), 'review event id');
   assertUnique(reviewEvents.map((event) => event.clientRequestId), 'review clientRequestId');
-
   const senseIds = new Set(senses.map((sense) => sense.id));
   const occurrencesById = new Map(occurrences.map((occurrence) => [occurrence.id, occurrence]));
   const cardIds = new Set(cards.map((card) => card.id));
@@ -237,25 +335,89 @@ export function parseBackupDocument(value: unknown): BackupDocument {
       throw new HttpError(400, 'VALIDATION', 'A card must point at its own sense and sentence.');
     }
   }
-  const scheduled = new Set(schedules.map((schedule) => schedule.cardId));
-  if (scheduled.size !== cardIds.size || [...cardIds].some((id) => !scheduled.has(id))) {
-    throw new HttpError(400, 'VALIDATION', 'Every card needs exactly one schedule.');
-  }
   for (const event of reviewEvents) {
     if (!cardIds.has(event.cardId)) {
       throw new HttpError(400, 'VALIDATION', 'A review event points at a missing card.');
     }
   }
-  return {
-    schemaVersion: BACKUP_SCHEMA_VERSION,
-    exportedAt: assertIso(value.exportedAt, 'exportedAt'),
-    progressRevision: assertInteger(value.progressRevision, 'progressRevision', 0),
-    senses,
-    occurrences,
-    cards,
-    schedules,
-    reviewEvents,
-  };
+}
+
+function assertRecognitionGraph(
+  senses: SenseJson[],
+  occurrences: OccurrenceJson[],
+  cards: CardJson[],
+  schedules: ScheduleJson[],
+  reviewEvents: ReviewEventJson[],
+  tasks: TaskJson[],
+  members: MemberJson[],
+  legacySchedules: ScheduleJson[],
+  rotations: RotationJson[],
+): void {
+  assertUnique(tasks.map((task) => task.id), 'task id');
+  assertUnique(members.map((member) => member.cardId), 'member card');
+  assertUnique(schedules.map((schedule) => schedule.cardId), 'schedule cardId');
+  assertUnique(legacySchedules.map((schedule) => schedule.cardId), 'legacy schedule cardId');
+  assertUnique(rotations.map((rotation) => rotation.taskId), 'rotation task');
+  const senseIds = new Set(senses.map((sense) => sense.id));
+  const cardsById = new Map(cards.map((card) => [card.id, card]));
+  const occurrenceIds = new Set(occurrences.map((occurrence) => occurrence.id));
+  if (tasks.length !== schedules.length || tasks.length !== rotations.length) {
+    throw new HttpError(400, 'VALIDATION', 'Each recognition task needs one active schedule and one rotation.');
+  }
+  const taskById = new Map(tasks.map((task) => [task.id, task]));
+  const activeByDonor = new Map(schedules.map((schedule) => [schedule.cardId, schedule]));
+  const rotationByTask = new Map(rotations.map((rotation) => [rotation.taskId, rotation]));
+  for (const task of tasks) {
+    if (!senseIds.has(task.senseId) || task.id !== recognitionTaskId(task.senseId)) {
+      throw new HttpError(400, 'VALIDATION', 'A task must name its own recognition id.');
+    }
+    const donor = cardsById.get(task.donorCardId);
+    if (!donor || donor.senseId !== task.senseId || !activeByDonor.has(task.donorCardId)) {
+      throw new HttpError(400, 'VALIDATION', 'A task donor must be one of its cards.');
+    }
+    const rotation = rotationByTask.get(task.id);
+    const occurrence = occurrences.find((item) => item.id === rotation?.occurrenceId);
+    if (!rotation || !occurrence || occurrence.senseId !== task.senseId || !occurrenceIds.has(rotation.occurrenceId)) {
+      throw new HttpError(400, 'VALIDATION', 'A rotation must name a sentence of its sense.');
+    }
+    const backed = new Set(
+      members
+        .filter((member) => member.taskId === task.id)
+        .map((member) => cardsById.get(member.cardId)?.occurrenceId)
+        .filter((id): id is string => typeof id === 'string'),
+    );
+    if (!backed.has(rotation.occurrenceId)) {
+      throw new HttpError(400, 'VALIDATION', 'A rotation must name a sentence that has a card.');
+    }
+  }
+  if (members.length !== cards.length) {
+    throw new HttpError(400, 'VALIDATION', 'Every card belongs to one recognition task.');
+  }
+  for (const member of members) {
+    const card = cardsById.get(member.cardId);
+    const task = taskById.get(member.taskId);
+    if (!card || !task || task.senseId !== card.senseId) {
+      throw new HttpError(400, 'VALIDATION', 'A task member points at a missing card.');
+    }
+  }
+  for (const legacy of legacySchedules) {
+    if (!cardsById.has(legacy.cardId)) {
+      throw new HttpError(400, 'VALIDATION', 'A legacy schedule points at a missing card.');
+    }
+  }
+  for (const event of reviewEvents) {
+    const card = cardsById.get(event.cardId);
+    if (!card) {
+      continue;
+    }
+    const taskId = recognitionTaskId(card.senseId);
+    if (event.taskId !== null && event.taskId !== taskId) {
+      throw new HttpError(400, 'VALIDATION', 'A review event names a different task.');
+    }
+    if (event.occurrenceId !== null && event.occurrenceId !== card.occurrenceId) {
+      throw new HttpError(400, 'VALIDATION', 'A review event names a different sentence.');
+    }
+  }
 }
 
 function parseArray<T>(value: unknown, field: string, parse: (value: unknown, index: number) => T): T[] {
@@ -312,8 +474,9 @@ function parseCard(value: unknown, index: number): CardJson {
   };
 }
 
-function parseSchedule(value: unknown, index: number): ScheduleJson {
-  const record = objectAt(value, `schedules[${index}]`);
+function parseSchedule(value: unknown, index: number, field = 'schedules'): ScheduleJson {
+  const label = `${field}[${index}]`;
+  const record = objectAt(value, label);
   assertOnlyKeys(
     record,
     [
@@ -331,29 +494,82 @@ function parseSchedule(value: unknown, index: number): ScheduleJson {
       'revision',
       'updatedAt',
     ],
-    `schedules[${index}]`,
+    label,
   );
   if (typeof record.state !== 'string' || !isStateName(record.state)) {
-    throw new HttpError(400, 'VALIDATION', `schedules[${index}].state is invalid.`);
+    throw new HttpError(400, 'VALIDATION', `${label}.state is invalid.`);
   }
   return {
-    cardId: assertUuid(record.cardId, `schedules[${index}].cardId`),
-    due: assertIso(record.due, `schedules[${index}].due`),
-    stability: assertFiniteNumber(record.stability, `schedules[${index}].stability`),
-    difficulty: assertFiniteNumber(record.difficulty, `schedules[${index}].difficulty`),
-    elapsedDays: assertInteger(record.elapsedDays, `schedules[${index}].elapsedDays`, 0),
-    scheduledDays: assertInteger(record.scheduledDays, `schedules[${index}].scheduledDays`, 0),
-    learningSteps: assertInteger(record.learningSteps, `schedules[${index}].learningSteps`, 0),
-    reps: assertInteger(record.reps, `schedules[${index}].reps`, 0),
-    lapses: assertInteger(record.lapses, `schedules[${index}].lapses`, 0),
+    cardId: assertUuid(record.cardId, `${label}.cardId`),
+    due: assertIso(record.due, `${label}.due`),
+    stability: assertFiniteNumber(record.stability, `${label}.stability`),
+    difficulty: assertFiniteNumber(record.difficulty, `${label}.difficulty`),
+    elapsedDays: assertInteger(record.elapsedDays, `${label}.elapsedDays`, 0),
+    scheduledDays: assertInteger(record.scheduledDays, `${label}.scheduledDays`, 0),
+    learningSteps: assertInteger(record.learningSteps, `${label}.learningSteps`, 0),
+    reps: assertInteger(record.reps, `${label}.reps`, 0),
+    lapses: assertInteger(record.lapses, `${label}.lapses`, 0),
     state: record.state,
-    lastReview: record.lastReview === null ? null : assertIso(record.lastReview, `schedules[${index}].lastReview`),
-    revision: assertInteger(record.revision, `schedules[${index}].revision`, 1),
-    updatedAt: assertIso(record.updatedAt, `schedules[${index}].updatedAt`),
+    lastReview: record.lastReview === null ? null : assertIso(record.lastReview, `${label}.lastReview`),
+    revision: assertInteger(record.revision, `${label}.revision`, 1),
+    updatedAt: assertIso(record.updatedAt, `${label}.updatedAt`),
   };
 }
 
-function parseEvent(value: unknown, index: number): ReviewEventJson {
+function parseTask(value: unknown, index: number): TaskJson {
+  const label = `tasks[${index}]`;
+  const record = objectAt(value, label);
+  assertOnlyKeys(record, ['id', 'senseId', 'taskType', 'policy', 'donorCardId', 'createdAt'], label);
+  if (record.taskType !== 'recognition') {
+    throw new HttpError(400, 'VALIDATION', `${label}.taskType is not supported.`);
+  }
+  if (record.policy !== TASK_POLICY) {
+    throw new HttpError(400, 'VALIDATION', `${label}.policy is not supported.`);
+  }
+  const senseId = assertUuid(record.senseId, `${label}.senseId`);
+  return {
+    id: assertTaskId(record.id, `${label}.id`, senseId),
+    senseId,
+    taskType: 'recognition',
+    policy: TASK_POLICY,
+    donorCardId: assertUuid(record.donorCardId, `${label}.donorCardId`),
+    createdAt: assertIso(record.createdAt, `${label}.createdAt`),
+  };
+}
+
+function parseMember(value: unknown, index: number): MemberJson {
+  const label = `members[${index}]`;
+  const record = objectAt(value, label);
+  assertOnlyKeys(record, ['taskId', 'cardId'], label);
+  return {
+    taskId: assertTaskId(record.taskId, `${label}.taskId`),
+    cardId: assertUuid(record.cardId, `${label}.cardId`),
+  };
+}
+
+function parseRotation(value: unknown, index: number): RotationJson {
+  const label = `rotations[${index}]`;
+  const record = objectAt(value, label);
+  assertOnlyKeys(record, ['taskId', 'occurrenceId'], label);
+  return {
+    taskId: assertTaskId(record.taskId, `${label}.taskId`),
+    occurrenceId: assertUuid(record.occurrenceId, `${label}.occurrenceId`),
+  };
+}
+
+function assertTaskId(value: unknown, field: string, senseId?: string): string {
+  const expected = senseId ? recognitionTaskId(senseId) : '';
+  if (typeof value !== 'string' || !value.startsWith('recognition:') || (senseId && value !== expected)) {
+    throw new HttpError(400, 'VALIDATION', `${field} is invalid.`);
+  }
+  const sense = value.slice('recognition:'.length);
+  if (!UUID.test(sense)) {
+    throw new HttpError(400, 'VALIDATION', `${field} is invalid.`);
+  }
+  return value;
+}
+
+function parseEvent(value: unknown, index: number, linked: boolean): ReviewEventJson {
   const label = `reviewEvents[${index}]`;
   const record = objectAt(value, label);
   assertOnlyKeys(
@@ -382,6 +598,7 @@ function parseEvent(value: unknown, index: number): ReviewEventJson {
       'elapsedDaysAfter',
       'learningStepsAfter',
       'createdAt',
+      ...(linked ? (['taskId', 'occurrenceId'] as const) : []),
     ],
     label,
   );
@@ -427,6 +644,8 @@ function parseEvent(value: unknown, index: number): ReviewEventJson {
     elapsedDaysAfter: assertInteger(record.elapsedDaysAfter, `${label}.elapsedDaysAfter`, 0),
     learningStepsAfter: assertInteger(record.learningStepsAfter, `${label}.learningStepsAfter`, 0),
     createdAt: assertIso(record.createdAt, `${label}.createdAt`),
+    taskId: linked ? (record.taskId === null ? null : assertTaskId(record.taskId, `${label}.taskId`)) : null,
+    occurrenceId: linked ? (record.occurrenceId === null ? null : assertUuid(record.occurrenceId, `${label}.occurrenceId`)) : null,
   };
 }
 
