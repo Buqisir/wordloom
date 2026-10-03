@@ -1,16 +1,8 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { readUser } from './auth.js';
-import { transaction } from './db.js';
+import { nextProgressRevision, nextScheduleRevision } from './clientSync.js';
 import { HttpError } from './errors.js';
-import {
-  bumpProgress,
-  listItems,
-  listSenses,
-  sameJson,
-  saveIdempotent,
-  takeIdempotent,
-  finishIdempotent,
-} from './learning.js';
+import { bumpProgress, listItems, listSenses, raiseScheduleFloor, runOwnedMutation, sameJson, saveIdempotent, scheduleFloor } from './learning.js';
 import { stateValue } from './scheduler.js';
 import type { ApiResult, BackupDocument, CardJson, OccurrenceJson, ReviewEventJson, ScheduleJson, SenseJson } from './types.js';
 import { isRecord, parseBackupDocument, rejectUnknown } from './validate.js';
@@ -47,16 +39,13 @@ export function exportBackup(db: DatabaseSync, userId: string, now: Date): Backu
 export function restoreBackup(
   db: DatabaseSync,
   now: () => Date,
-  userId: string,
+  sessionId: string,
+  expectedOwner: string | undefined,
   body: Record<string, unknown>,
   key: string,
   requestHash: string,
 ): ApiResult {
-  return finishIdempotent(db, userId, key, requestHash, () => transaction(db, () => {
-    const replay = takeIdempotent(db, userId, key, requestHash);
-    if (replay) {
-      return replay;
-    }
+  return runOwnedMutation(db, now, sessionId, expectedOwner, key, requestHash, (userId) => {
     rejectUnknown(body, ['mode', 'confirm', 'document'], 'restore');
     if (body.mode !== 'replace' && body.mode !== 'merge') {
       throw new HttpError(400, 'VALIDATION', 'mode must be replace or merge.');
@@ -71,10 +60,22 @@ export function restoreBackup(
         throw new HttpError(400, 'VALIDATION', 'Replace restore requires confirm set to replace.');
       }
       assertSnapshotAssignable(db, userId, document);
+      const liveRevision = readUser(db, userId).progressRevision;
+      const liveSchedules = new Map(
+        (
+          db.prepare('SELECT card_id, revision FROM schedules WHERE user_id = ?').all(userId) as Array<{
+            card_id: string;
+            revision: number | bigint;
+          }>
+        ).map((row) => [row.card_id, numberValue(row.revision)]),
+      );
+      for (const [cardId, revision] of liveSchedules) {
+        raiseScheduleFloor(db, userId, cardId, revision);
+      }
       deleteLearning(db, userId);
-      insertSnapshot(db, userId, document);
-      db.prepare('UPDATE users SET progress_revision = ? WHERE id = ?').run(document.progressRevision, userId);
-      progressRevision = document.progressRevision;
+      insertSnapshot(db, userId, document, liveSchedules);
+      progressRevision = nextProgressRevision(liveRevision, document.progressRevision);
+      db.prepare('UPDATE users SET progress_revision = ? WHERE id = ?').run(progressRevision, userId);
     } else {
       const inserted = mergeSnapshot(db, userId, document);
       progressRevision = inserted ? bumpProgress(db, userId) : readUser(db, userId).progressRevision;
@@ -92,7 +93,7 @@ export function restoreBackup(
     };
     saveIdempotent(db, userId, key, requestHash, 200, response, now().toISOString());
     return { status: 200, body: response, replayed: false };
-  }));
+  });
 }
 
 function assertSnapshotAssignable(db: DatabaseSync, userId: string, document: BackupDocument): void {
@@ -127,10 +128,9 @@ function deleteLearning(db: DatabaseSync, userId: string): void {
   db.prepare('DELETE FROM learner_cards WHERE user_id = ?').run(userId);
   db.prepare('DELETE FROM source_occurrences WHERE user_id = ?').run(userId);
   db.prepare('DELETE FROM word_senses WHERE user_id = ?').run(userId);
-  db.prepare('DELETE FROM idempotency_keys WHERE user_id = ?').run(userId);
 }
 
-function insertSnapshot(db: DatabaseSync, userId: string, document: BackupDocument): void {
+function insertSnapshot(db: DatabaseSync, userId: string, document: BackupDocument, liveSchedules: Map<string, number>): void {
   for (const sense of document.senses) {
     insertSense(db, userId, sense);
   }
@@ -141,7 +141,8 @@ function insertSnapshot(db: DatabaseSync, userId: string, document: BackupDocume
     insertCard(db, userId, card);
   }
   for (const schedule of document.schedules) {
-    insertSchedule(db, userId, schedule);
+    const seen = Math.max(liveSchedules.get(schedule.cardId) ?? 0, scheduleFloor(db, userId, schedule.cardId));
+    insertSchedule(db, userId, schedule, nextScheduleRevision(seen, schedule.revision));
   }
   for (const event of document.reviewEvents) {
     insertEvent(db, userId, event);
@@ -176,8 +177,9 @@ function mergeSnapshot(db: DatabaseSync, userId: string, document: BackupDocumen
         'schedule',
         schedule.cardId,
         schedule,
-        () => insertSchedule(db, userId, schedule),
+        () => insertSchedule(db, userId, schedule, mergedScheduleRevision(db, userId, schedule.cardId, schedule.revision)),
         () => storedSchedule(db, userId, schedule.cardId),
+        (stored, incoming) => sameJson(withoutRevision(stored), withoutRevision(incoming)),
       ) || inserted;
   }
   for (const event of document.reviewEvents) {
@@ -194,6 +196,7 @@ function mergeRow(
   incoming: unknown,
   insert: () => void,
   load: () => unknown,
+  same: (stored: unknown, incoming: unknown) => boolean = sameJson,
 ): boolean {
   const owner = OWNERS[kind];
   const row = db.prepare(owner.sql).get(id) as { user_id: string } | undefined;
@@ -204,7 +207,7 @@ function mergeRow(
   if (row.user_id !== userId) {
     throw new HttpError(409, 'CONFLICT', `${owner.label} belongs to another account.`);
   }
-  if (!sameJson(load(), incoming)) {
+  if (!same(load(), incoming)) {
     throw new HttpError(409, 'SNAPSHOT_CONFLICT', `${owner.label} does not match the stored record.`);
   }
   return false;
@@ -250,7 +253,15 @@ function insertCard(db: DatabaseSync, userId: string, card: CardJson): void {
   );
 }
 
-function insertSchedule(db: DatabaseSync, userId: string, schedule: ScheduleJson): void {
+function withoutRevision(value: unknown): unknown {
+  if (!isRecord(value)) {
+    return value;
+  }
+  const { revision: _revision, ...rest } = value;
+  return rest;
+}
+
+function insertSchedule(db: DatabaseSync, userId: string, schedule: ScheduleJson, revision = schedule.revision): void {
   db.prepare(
     `INSERT INTO schedules (
       card_id, user_id, due, stability, difficulty, elapsed_days, scheduled_days, learning_steps,
@@ -269,9 +280,15 @@ function insertSchedule(db: DatabaseSync, userId: string, schedule: ScheduleJson
     schedule.lapses,
     stateValue(schedule.state),
     schedule.lastReview,
-    schedule.revision,
+    revision,
     schedule.updatedAt,
   );
+  raiseScheduleFloor(db, userId, schedule.cardId, revision);
+}
+
+function mergedScheduleRevision(db: DatabaseSync, userId: string, cardId: string, snapshotRevision: number): number {
+  const floor = scheduleFloor(db, userId, cardId);
+  return floor === 0 ? snapshotRevision : nextScheduleRevision(floor, snapshotRevision);
 }
 
 function insertEvent(db: DatabaseSync, userId: string, event: ReviewEventJson): void {

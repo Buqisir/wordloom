@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
+import { lockedOwner } from './auth.js';
+import { isDue } from './clientSync.js';
 import { canonicalJson } from './crypto.js';
 import { changesOf, transaction } from './db.js';
 import { HttpError } from './errors.js';
@@ -98,16 +100,13 @@ JOIN schedules sch ON sch.card_id = c.id AND sch.user_id = c.user_id
 export function createCard(
   db: DatabaseSync,
   now: () => Date,
-  userId: string,
+  sessionId: string,
+  expectedOwner: string | undefined,
   body: Record<string, unknown>,
   key: string,
   requestHash: string,
 ): ApiResult {
-  return finishIdempotent(db, userId, key, requestHash, () => transaction(db, () => {
-    const replay = takeIdempotent(db, userId, key, requestHash);
-    if (replay) {
-      return replay;
-    }
+  return runOwnedMutation(db, now, sessionId, expectedOwner, key, requestHash, (userId) => {
     const input = parseManualAdd(body);
     const instantDate = now();
     const instant = instantDate.toISOString();
@@ -141,11 +140,12 @@ export function createCard(
       'INSERT INTO learner_cards (id, user_id, sense_id, occurrence_id, created_at, revision) VALUES (?, ?, ?, ?, ?, 1)',
     ).run(cardId, userId, senseId, occurrenceId, instant);
     insertSchedule(db, userId, cardId, schedule, 1, instant);
+    raiseScheduleFloor(db, userId, cardId, 1);
     const progressRevision = bumpProgress(db, userId);
     const response = { item: requireItem(db, userId, cardId), progressRevision };
     saveIdempotent(db, userId, key, requestHash, 201, response, instant);
     return { status: 201, body: response, replayed: false };
-  }));
+  });
 }
 
 export function listItems(db: DatabaseSync, userId: string): ItemJson[] {
@@ -158,10 +158,17 @@ export function getItem(db: DatabaseSync, userId: string, cardId: string): ItemJ
 }
 
 export function listQueue(db: DatabaseSync, userId: string, now: Date): ItemJson[] {
+  const nowMs = now.getTime();
+  return listItems(db, userId)
+    .filter((item) => isDue(item.schedule.due, nowMs))
+    .sort((left, right) => left.schedule.due.localeCompare(right.schedule.due) || left.card.id.localeCompare(right.card.id));
+}
+
+export function listAccountEvents(db: DatabaseSync, userId: string): ReviewEventJson[] {
   const rows = db
-    .prepare(`${ITEM_SQL} WHERE c.user_id = ? AND sch.due <= ? ORDER BY sch.due ASC, c.id ASC`)
-    .all(userId, now.toISOString());
-  return rows.map((row) => toItem(row as Record<string, unknown>));
+    .prepare('SELECT * FROM review_events WHERE user_id = ? ORDER BY created_at ASC, rowid ASC')
+    .all(userId) as EventRow[];
+  return rows.map(toEvent);
 }
 
 export function listEvents(db: DatabaseSync, userId: string, cardId: string): ReviewEventJson[] {
@@ -191,17 +198,14 @@ export function listSenses(db: DatabaseSync, userId: string): Array<SenseJson & 
 export function reviewCard(
   db: DatabaseSync,
   now: () => Date,
-  userId: string,
+  sessionId: string,
+  expectedOwner: string | undefined,
   cardId: string,
   body: Record<string, unknown>,
   key: string,
   requestHash: string,
 ): ApiResult {
-  return finishIdempotent(db, userId, key, requestHash, () => transaction(db, () => {
-    const replay = takeIdempotent(db, userId, key, requestHash);
-    if (replay) {
-      return replay;
-    }
+  return runOwnedMutation(db, now, sessionId, expectedOwner, key, requestHash, (userId) => {
     const review = parseReview(body);
     const row = db.prepare('SELECT * FROM schedules WHERE card_id = ? AND user_id = ?').get(cardId, userId) as ScheduleRow | undefined;
     if (!row || !db.prepare('SELECT id FROM learner_cards WHERE id = ? AND user_id = ?').get(cardId, userId)) {
@@ -250,6 +254,7 @@ export function reviewCard(
       }
       revisionAfter = revision + 1;
       updatedAt = reviewedAt;
+      raiseScheduleFloor(db, userId, cardId, revisionAfter);
     }
     const eventId = randomUUID();
     db.prepare(
@@ -294,23 +299,34 @@ export function reviewCard(
     };
     saveIdempotent(db, userId, key, requestHash, 201, response, reviewedAt);
     return { status: 201, body: response, replayed: false };
-  }));
+  });
 }
 
-export function finishIdempotent(
+export function runOwnedMutation(
   db: DatabaseSync,
-  userId: string,
+  now: () => Date,
+  sessionId: string,
+  expectedOwner: string | undefined,
   key: string,
   requestHash: string,
-  write: () => ApiResult,
+  mutate: (userId: string) => ApiResult,
 ): ApiResult {
+  let ownerId = '';
   try {
-    return write();
+    return transaction(db, () => {
+      const userId = lockedOwner(db, sessionId, expectedOwner, now());
+      ownerId = userId;
+      const replay = takeIdempotent(db, userId, key, requestHash);
+      if (replay) {
+        return replay;
+      }
+      return mutate(userId);
+    });
   } catch (error) {
-    if (!isIdempotencyRace(error)) {
+    if (!ownerId || !isIdempotencyRace(error)) {
       throw error;
     }
-    const replay = takeIdempotent(db, userId, key, requestHash);
+    const replay = takeIdempotent(db, ownerId, key, requestHash);
     if (replay) {
       return replay;
     }
@@ -376,6 +392,20 @@ function requireEvent(db: DatabaseSync, userId: string, eventId: string): Review
     throw new HttpError(500, 'INTERNAL', 'Review event was not stored.');
   }
   return toEvent(row);
+}
+
+export function raiseScheduleFloor(db: DatabaseSync, userId: string, cardId: string, revision: number): void {
+  db.prepare(
+    `INSERT INTO schedule_generation (user_id, card_id, high_water) VALUES (?, ?, ?)
+     ON CONFLICT(user_id, card_id) DO UPDATE SET high_water = max(high_water, excluded.high_water)`,
+  ).run(userId, cardId, revision);
+}
+
+export function scheduleFloor(db: DatabaseSync, userId: string, cardId: string): number {
+  const row = db.prepare('SELECT high_water FROM schedule_generation WHERE user_id = ? AND card_id = ?').get(userId, cardId) as
+    | { high_water: number | bigint }
+    | undefined;
+  return row ? asNumber(row.high_water) : 0;
 }
 
 function insertSchedule(db: DatabaseSync, userId: string, cardId: string, schedule: StoredSchedule, revision: number, updatedAt: string): void {

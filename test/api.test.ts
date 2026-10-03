@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { after, before, describe, it } from 'node:test';
+import { lockedOwner } from '../src/auth.js';
 import { sha256 } from '../src/crypto.js';
+import { openDatabase, transaction } from '../src/db.js';
+import { HttpError } from '../src/errors.js';
 import { listenPolicyFromEnv, listenPortFromEnv, resolveListenPolicy } from '../src/protect.js';
 import { api, emptyJar, login, register, startApp, type RunningApp } from './support.js';
 
@@ -424,7 +429,10 @@ describe('wordloom backend', { concurrency: 1 }, () => {
     assert.equal(after.json.items[0].occurrence.sentence, 'The sounding line read six fathom.');
     assert.equal(after.json.items[0].sense.meaning, 'a unit of water depth');
     assert.equal(after.json.items[0].schedule.due, backup.json.schedules[0].due);
-    assert.equal(after.json.items[0].schedule.revision, backup.json.schedules[0].revision);
+    assert.equal(after.json.items[0].schedule.stability, backup.json.schedules[0].stability);
+    assert.equal(after.json.items[0].schedule.difficulty, backup.json.schedules[0].difficulty);
+    assert.equal(after.json.items[0].schedule.state, backup.json.schedules[0].state);
+    assert.equal(after.json.items[0].schedule.revision, backup.json.schedules[0].revision + 1);
     const events = await api(app.base, second, 'GET', `/api/cards/${cardId}/events`);
     assert.equal(events.json.events[0].id, backup.json.reviewEvents[0].id);
 
@@ -1027,6 +1035,778 @@ describe('vite 5173 to api 8787', () => {
     }
   });
 });
+
+describe('owner header, due clock, and restore receipts', { concurrency: 1 }, () => {
+  it('does not apply account A writes when the cookies belong to account B', async () => {
+    const app = await startApp();
+    try {
+      const owner = await register(app.base, uniqueEmail('owner'), password);
+      const other = await register(app.base, uniqueEmail('other'), password);
+      const created = await api(app.base, owner.jar, 'POST', '/api/cards', sampleCard('keel', 'The keel held the line.'), {
+        csrf: 'session',
+        idempotencyKey: randomUUID(),
+      });
+      assert.equal(created.status, 201);
+      const ownerBefore = await api(app.base, owner.jar, 'GET', '/api/cards');
+      const otherBefore = await api(app.base, other.jar, 'GET', '/api/cards');
+      const otherKeys = idempotencyCount(app.dbPath, other.body.user.id);
+      const mismatched = await api(app.base, other.jar, 'POST', '/api/cards', sampleCard('wake', 'The wake belonged to the first account.'), {
+        csrf: 'session',
+        idempotencyKey: randomUUID(),
+        ownerId: owner.body.user.id,
+      });
+      assert.equal(mismatched.status, 409);
+      assert.equal(mismatched.json.error.code, 'OWNER_MISMATCH');
+      const review = await api(
+        app.base,
+        other.jar,
+        'POST',
+        `/api/cards/${created.json.item.card.id}/reviews`,
+        { grade: 'good', affectsSchedule: true, expectedScheduleRevision: 1 },
+        { csrf: 'session', idempotencyKey: randomUUID(), ownerId: owner.body.user.id },
+      );
+      assert.equal(review.status, 409);
+      assert.equal(review.json.error.code, 'OWNER_MISMATCH');
+      const missing = await api(app.base, other.jar, 'POST', '/api/cards', sampleCard('bilge', 'A missing owner header must not write.'), {
+        csrf: 'session',
+        idempotencyKey: randomUUID(),
+        ownerId: null,
+      });
+      assert.equal(missing.status, 400);
+      assert.equal(missing.json.error.code, 'VALIDATION');
+      const ownerAfter = await api(app.base, owner.jar, 'GET', '/api/cards');
+      const otherAfter = await api(app.base, other.jar, 'GET', '/api/cards');
+      assert.equal(ownerAfter.json.items.length, ownerBefore.json.items.length);
+      assert.equal(otherAfter.json.items.length, otherBefore.json.items.length);
+      assert.equal(idempotencyCount(app.dbPath, other.body.user.id), otherKeys);
+      const events = await api(app.base, owner.jar, 'GET', `/api/cards/${created.json.item.card.id}/events`);
+      assert.equal(events.json.events.length, 0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects a revoked or expired session inside the write transaction', async () => {
+    const now = new Date('2026-04-01T12:00:00.000Z');
+    const app = await startApp({ now: () => now });
+    try {
+      const owner = await register(app.base, uniqueEmail('locked'), password);
+      const db = new DatabaseSync(app.dbPath);
+      try {
+        const session = db.prepare('SELECT id FROM sessions WHERE user_id = ? AND revoked_at IS NULL').get(owner.body.user.id) as {
+          id: string;
+        };
+        db.prepare('UPDATE sessions SET revoked_at = ? WHERE id = ?').run(now.toISOString(), session.id);
+        assert.throws(
+          () => transaction(db, () => lockedOwner(db, session.id, owner.body.user.id, now)),
+          (error: unknown) => error instanceof HttpError && error.status === 401,
+        );
+        db.prepare('UPDATE sessions SET revoked_at = NULL, expires_at = ? WHERE id = ?').run('2026-04-01T11:00:00.000Z', session.id);
+        assert.throws(
+          () => transaction(db, () => lockedOwner(db, session.id, owner.body.user.id, now)),
+          (error: unknown) => error instanceof HttpError && error.status === 401,
+        );
+      } finally {
+        db.close();
+      }
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('includes a card at its due instant and excludes it one millisecond earlier', async () => {
+    let clock = Date.parse('2026-04-01T12:00:00.000Z');
+    const app = await startApp({ now: () => new Date(clock) });
+    try {
+      const jar = (await register(app.base, uniqueEmail('due'), password)).jar;
+      const created = await api(app.base, jar, 'POST', '/api/cards', sampleCard('harbor', 'The harbor light was a thin line.'), {
+        csrf: 'session',
+        idempotencyKey: randomUUID(),
+      });
+      assert.equal(created.status, 201);
+      const cardId = created.json.item.card.id as string;
+      const initial = await api(app.base, jar, 'GET', '/api/queue');
+      assert.equal(
+        initial.json.items.some((item: { card: { id: string } }) => item.card.id === cardId),
+        true,
+      );
+      const reviewed = await api(
+        app.base,
+        jar,
+        'POST',
+        `/api/cards/${cardId}/reviews`,
+        { grade: 'good', affectsSchedule: true, expectedScheduleRevision: 1 },
+        { csrf: 'session', idempotencyKey: randomUUID() },
+      );
+      assert.equal(reviewed.status, 201);
+      const due = Date.parse(reviewed.json.schedule.due);
+      assert.ok(due > clock);
+      clock = due - 1;
+      const before = await api(app.base, jar, 'GET', '/api/queue');
+      assert.equal(
+        before.json.items.some((item: { card: { id: string } }) => item.card.id === cardId),
+        false,
+      );
+      clock = due;
+      const atDue = await api(app.base, jar, 'GET', '/api/queue');
+      assert.equal(
+        atDue.json.items.some((item: { card: { id: string } }) => item.card.id === cardId),
+        true,
+      );
+      const events = await api(app.base, jar, 'GET', `/api/cards/${cardId}/events`);
+      assert.equal(events.json.events.length, 1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('advances replace revision and keeps receipts so a delayed retry does not apply twice', async () => {
+    const app = await startApp();
+    try {
+      const owner = await register(app.base, uniqueEmail('receipt'), password);
+      const other = await register(app.base, uniqueEmail('bystander'), password);
+      await api(app.base, other.jar, 'POST', '/api/cards', sampleCard('lumen', 'A lumen marked the other account.'), {
+        csrf: 'session',
+        idempotencyKey: randomUUID(),
+      });
+      const otherBefore = await api(app.base, other.jar, 'GET', '/api/auth/me');
+      const keel = await api(app.base, owner.jar, 'POST', '/api/cards', sampleCard('keel', 'The keel held the first snapshot.'), {
+        csrf: 'session',
+        idempotencyKey: randomUUID(),
+      });
+      assert.equal(keel.status, 201);
+      const keelId = keel.json.item.card.id as string;
+      const firstBackup = await api(app.base, owner.jar, 'GET', '/api/backup');
+      const reviewKey = randomUUID();
+      const reviewed = await api(
+        app.base,
+        owner.jar,
+        'POST',
+        `/api/cards/${keelId}/reviews`,
+        { grade: 'good', affectsSchedule: true, expectedScheduleRevision: 1 },
+        { csrf: 'session', idempotencyKey: reviewKey },
+      );
+      assert.equal(reviewed.status, 201);
+      const createKey = randomUUID();
+      const wake = await api(app.base, owner.jar, 'POST', '/api/cards', sampleCard('wake', 'The wake arrived after the first snapshot.'), {
+        csrf: 'session',
+        idempotencyKey: createKey,
+      });
+      assert.equal(wake.status, 201);
+      const secondBackup = await api(app.base, owner.jar, 'GET', '/api/backup');
+      const live = await api(app.base, owner.jar, 'GET', '/api/auth/me');
+      const restoreKey = randomUUID();
+      const restored = await api(
+        app.base,
+        owner.jar,
+        'POST',
+        '/api/backup/restore',
+        { mode: 'replace', confirm: 'replace', document: firstBackup.json },
+        { csrf: 'session', idempotencyKey: restoreKey },
+      );
+      assert.equal(restored.status, 200);
+      const liveRevision = live.json.user.progressRevision as number;
+      const snapshotRevision = firstBackup.json.progressRevision as number;
+      assert.equal(restored.json.progressRevision, Math.max(liveRevision, snapshotRevision) + 1);
+      assert.ok(restored.json.progressRevision > liveRevision);
+      assert.ok(restored.json.progressRevision > snapshotRevision);
+      const otherAfter = await api(app.base, other.jar, 'GET', '/api/auth/me');
+      assert.equal(otherAfter.json.user.progressRevision, otherBefore.json.user.progressRevision);
+
+      const secondKey = randomUUID();
+      const secondRestore = await api(
+        app.base,
+        owner.jar,
+        'POST',
+        '/api/backup/restore',
+        { mode: 'replace', confirm: 'replace', document: secondBackup.json },
+        { csrf: 'session', idempotencyKey: secondKey },
+      );
+      assert.equal(secondRestore.status, 200);
+      const replayFirst = await api(
+        app.base,
+        owner.jar,
+        'POST',
+        '/api/backup/restore',
+        { mode: 'replace', confirm: 'replace', document: firstBackup.json },
+        { csrf: 'session', idempotencyKey: restoreKey },
+      );
+      assert.equal(replayFirst.status, 200);
+      assert.equal(replayFirst.replayed, true);
+      assert.deepEqual(replayFirst.json, restored.json);
+      const afterReplay = await api(app.base, owner.jar, 'GET', '/api/cards');
+      assert.equal(afterReplay.json.items.length, 2);
+      const replayReview = await api(
+        app.base,
+        owner.jar,
+        'POST',
+        `/api/cards/${keelId}/reviews`,
+        { grade: 'good', affectsSchedule: true, expectedScheduleRevision: 1 },
+        { csrf: 'session', idempotencyKey: reviewKey },
+      );
+      assert.equal(replayReview.status, 201);
+      assert.equal(replayReview.replayed, true);
+      const eventsAfterReplay = await api(app.base, owner.jar, 'GET', `/api/cards/${keelId}/events`);
+      assert.equal(eventsAfterReplay.json.events.length, 1);
+
+      const extraKey = randomUUID();
+      const bilge = await api(app.base, owner.jar, 'POST', '/api/cards', sampleCard('bilge', 'The bilge was added after both snapshots.'), {
+        csrf: 'session',
+        idempotencyKey: extraKey,
+      });
+      assert.equal(bilge.status, 201);
+      const wipe = await api(
+        app.base,
+        owner.jar,
+        'POST',
+        '/api/backup/restore',
+        { mode: 'replace', confirm: 'replace', document: firstBackup.json },
+        { csrf: 'session', idempotencyKey: randomUUID() },
+      );
+      assert.equal(wipe.status, 200);
+      const replayCreate = await api(app.base, owner.jar, 'POST', '/api/cards', sampleCard('bilge', 'The bilge was added after both snapshots.'), {
+        csrf: 'session',
+        idempotencyKey: extraKey,
+      });
+      assert.equal(replayCreate.status, 201);
+      assert.equal(replayCreate.replayed, true);
+      const replayWake = await api(app.base, owner.jar, 'POST', '/api/cards', sampleCard('wake', 'The wake arrived after the first snapshot.'), {
+        csrf: 'session',
+        idempotencyKey: createKey,
+      });
+      assert.equal(replayWake.status, 201);
+      assert.equal(replayWake.replayed, true);
+      const replayReviewAgain = await api(
+        app.base,
+        owner.jar,
+        'POST',
+        `/api/cards/${keelId}/reviews`,
+        { grade: 'good', affectsSchedule: true, expectedScheduleRevision: 1 },
+        { csrf: 'session', idempotencyKey: reviewKey },
+      );
+      assert.equal(replayReviewAgain.status, 201);
+      assert.equal(replayReviewAgain.replayed, true);
+      const finalCards = await api(app.base, owner.jar, 'GET', '/api/cards');
+      assert.equal(finalCards.json.items.length, 1);
+      assert.equal(finalCards.json.items[0].card.id, keelId);
+      const finalEvents = await api(app.base, owner.jar, 'GET', `/api/cards/${keelId}/events`);
+      assert.equal(finalEvents.json.events.length, 0);
+      const otherStill = await api(app.base, other.jar, 'GET', '/api/auth/me');
+      assert.equal(otherStill.json.user.progressRevision, otherBefore.json.user.progressRevision);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('returns one owner-tagged library snapshot and rejects a different owner', async () => {
+    const app = await startApp();
+    try {
+      const owner = await register(app.base, uniqueEmail('library'), password);
+      const other = await register(app.base, uniqueEmail('library-other'), password);
+      const created = await api(app.base, owner.jar, 'POST', '/api/cards', sampleCard('harbor', 'The harbor light was a thin line.'), {
+        csrf: 'session',
+        idempotencyKey: randomUUID(),
+      });
+      assert.equal(created.status, 201);
+      await api(app.base, other.jar, 'POST', '/api/cards', sampleCard('lumen', 'A lumen marked the other account.'), {
+        csrf: 'session',
+        idempotencyKey: randomUUID(),
+      });
+      const snapshot = await api(app.base, owner.jar, 'GET', '/api/library');
+      assert.equal(snapshot.status, 200);
+      assert.equal(snapshot.json.user.id, owner.body.user.id);
+      assert.equal(snapshot.json.items.length, 1);
+      assert.equal(snapshot.json.items[0].sense.lemma, 'harbor');
+      assert.equal(snapshot.json.queue.length, 1);
+      assert.equal(snapshot.json.senses.length, 1);
+      assert.deepEqual(snapshot.json.events, []);
+      assert.equal(
+        snapshot.json.items.some((item: { sense: { lemma: string } }) => item.sense.lemma === 'lumen'),
+        false,
+      );
+      const mismatched = await api(app.base, other.jar, 'GET', '/api/library', undefined, { ownerId: owner.body.user.id });
+      assert.equal(mismatched.status, 409);
+      assert.equal(mismatched.json.error.code, 'OWNER_MISMATCH');
+      assert.equal(mismatched.json.items, undefined);
+      const missing = await api(app.base, owner.jar, 'GET', '/api/library', undefined, { ownerId: null });
+      assert.equal(missing.status, 400);
+      assert.equal(missing.json.error.code, 'VALIDATION');
+      const otherLibrary = await api(app.base, other.jar, 'GET', '/api/library');
+      assert.equal(otherLibrary.json.items.length, 1);
+      assert.equal(otherLibrary.json.items[0].sense.lemma, 'lumen');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects an uncommitted review after replace restores an earlier schedule revision', async () => {
+    const app = await startApp();
+    try {
+      const jar = (await register(app.base, uniqueEmail('aba'), password)).jar;
+      const created = await api(app.base, jar, 'POST', '/api/cards', sampleCard('keel', 'The keel held the first snapshot.'), {
+        csrf: 'session',
+        idempotencyKey: randomUUID(),
+      });
+      assert.equal(created.status, 201);
+      const cardId = created.json.item.card.id as string;
+      const backup = await api(app.base, jar, 'GET', '/api/backup');
+      assert.equal(backup.json.schedules[0].revision, 1);
+      const reviewed = await api(
+        app.base,
+        jar,
+        'POST',
+        `/api/cards/${cardId}/reviews`,
+        { grade: 'good', affectsSchedule: true, expectedScheduleRevision: 1 },
+        { csrf: 'session', idempotencyKey: randomUUID() },
+      );
+      assert.equal(reviewed.status, 201);
+      assert.equal(reviewed.json.schedule.revision, 2);
+      const live = await api(app.base, jar, 'GET', '/api/cards');
+      const liveRevision = live.json.items[0].schedule.revision as number;
+      const restored = await api(
+        app.base,
+        jar,
+        'POST',
+        '/api/backup/restore',
+        { mode: 'replace', confirm: 'replace', document: backup.json },
+        { csrf: 'session', idempotencyKey: randomUUID() },
+      );
+      assert.equal(restored.status, 200);
+      const after = await api(app.base, jar, 'GET', '/api/cards');
+      const schedule = after.json.items[0].schedule;
+      assert.equal(schedule.due, backup.json.schedules[0].due);
+      assert.equal(schedule.stability, backup.json.schedules[0].stability);
+      assert.equal(schedule.difficulty, backup.json.schedules[0].difficulty);
+      assert.equal(schedule.state, backup.json.schedules[0].state);
+      assert.equal(schedule.revision, Math.max(liveRevision, backup.json.schedules[0].revision) + 1);
+      assert.ok(schedule.revision > 1);
+      const staleKey = randomUUID();
+      const stale = await api(
+        app.base,
+        jar,
+        'POST',
+        `/api/cards/${cardId}/reviews`,
+        { grade: 'again', affectsSchedule: true, expectedScheduleRevision: 1 },
+        { csrf: 'session', idempotencyKey: staleKey },
+      );
+      assert.equal(stale.status, 409);
+      assert.equal(stale.json.error.code, 'REVISION_CONFLICT');
+      assert.equal(stale.replayed, false);
+      const events = await api(app.base, jar, 'GET', `/api/cards/${cardId}/events`);
+      assert.equal(events.json.events.length, 0);
+      const staleAgain = await api(
+        app.base,
+        jar,
+        'POST',
+        `/api/cards/${cardId}/reviews`,
+        { grade: 'again', affectsSchedule: true, expectedScheduleRevision: 1 },
+        { csrf: 'session', idempotencyKey: staleKey },
+      );
+      assert.equal(staleAgain.status, 409);
+      assert.equal(staleAgain.replayed, false);
+      const fresh = await api(
+        app.base,
+        jar,
+        'POST',
+        `/api/cards/${cardId}/reviews`,
+        { grade: 'good', affectsSchedule: true, expectedScheduleRevision: schedule.revision },
+        { csrf: 'session', idempotencyKey: randomUUID() },
+      );
+      assert.equal(fresh.status, 201);
+      const afterFresh = await api(app.base, jar, 'GET', `/api/cards/${cardId}/events`);
+      assert.equal(afterFresh.json.events.length, 1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects a queued review after a deleted schedule is restored from an earlier snapshot', async () => {
+    const app = await startApp();
+    try {
+      const jar = (await register(app.base, uniqueEmail('aba-delete'), password)).jar;
+      const created = await api(app.base, jar, 'POST', '/api/cards', sampleCard('keel', 'The keel held the first snapshot.'), {
+        csrf: 'session',
+        idempotencyKey: randomUUID(),
+      });
+      assert.equal(created.status, 201);
+      const cardId = created.json.item.card.id as string;
+      const backup = await api(app.base, jar, 'GET', '/api/backup');
+      assert.equal(backup.json.schedules[0].revision, 1);
+      const reviewed = await api(
+        app.base,
+        jar,
+        'POST',
+        `/api/cards/${cardId}/reviews`,
+        { grade: 'good', affectsSchedule: true, expectedScheduleRevision: 1 },
+        { csrf: 'session', idempotencyKey: randomUUID() },
+      );
+      assert.equal(reviewed.status, 201);
+      assert.equal(reviewed.json.schedule.revision, 2);
+      const empty = {
+        schemaVersion: backup.json.schemaVersion,
+        exportedAt: backup.json.exportedAt,
+        progressRevision: backup.json.progressRevision,
+        senses: [],
+        occurrences: [],
+        cards: [],
+        schedules: [],
+        reviewEvents: [],
+      };
+      const wiped = await api(app.base, jar, 'POST', '/api/backup/restore', { mode: 'replace', confirm: 'replace', document: empty }, {
+        csrf: 'session',
+        idempotencyKey: randomUUID(),
+      });
+      assert.equal(wiped.status, 200);
+      const gone = await api(app.base, jar, 'GET', '/api/cards');
+      assert.equal(gone.json.items.length, 0);
+      const restored = await api(
+        app.base,
+        jar,
+        'POST',
+        '/api/backup/restore',
+        { mode: 'replace', confirm: 'replace', document: backup.json },
+        { csrf: 'session', idempotencyKey: randomUUID() },
+      );
+      assert.equal(restored.status, 200);
+      const after = await api(app.base, jar, 'GET', '/api/cards');
+      assert.equal(after.json.items.length, 1);
+      const schedule = after.json.items[0].schedule;
+      assert.equal(schedule.due, backup.json.schedules[0].due);
+      assert.equal(schedule.stability, backup.json.schedules[0].stability);
+      assert.equal(schedule.difficulty, backup.json.schedules[0].difficulty);
+      assert.equal(schedule.state, backup.json.schedules[0].state);
+      assert.ok(schedule.revision > 2);
+      const staleKey = randomUUID();
+      const stale = await api(
+        app.base,
+        jar,
+        'POST',
+        `/api/cards/${cardId}/reviews`,
+        { grade: 'again', affectsSchedule: true, expectedScheduleRevision: 2 },
+        { csrf: 'session', idempotencyKey: staleKey },
+      );
+      assert.equal(stale.status, 409);
+      assert.equal(stale.json.error.code, 'REVISION_CONFLICT');
+      assert.equal(stale.replayed, false);
+      const events = await api(app.base, jar, 'GET', `/api/cards/${cardId}/events`);
+      assert.equal(events.json.events.length, 0);
+      const staleAgain = await api(
+        app.base,
+        jar,
+        'POST',
+        `/api/cards/${cardId}/reviews`,
+        { grade: 'again', affectsSchedule: true, expectedScheduleRevision: 2 },
+        { csrf: 'session', idempotencyKey: staleKey },
+      );
+      assert.equal(staleAgain.status, 409);
+      assert.equal(staleAgain.replayed, false);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('schema migration', () => {
+  it('upgrades a populated version 1 database without changing learning rows', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wordloom-migrate-'));
+    const dbPath = join(dir, 'wordloom.sqlite');
+    const before = seedVersion1(dbPath);
+    const db = openDatabase(dbPath);
+    try {
+      assert.equal(schemaVersion(db), 2);
+      assert.deepEqual(learningRows(db), before);
+      assert.deepEqual(scheduleFloors(db), [
+        { card_id: 'card-keel', high_water: 3 },
+        { card_id: 'card-wake', high_water: 4 },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('restarts a partial version 1 upgrade without lowering an existing floor', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wordloom-migrate-partial-'));
+    const dbPath = join(dir, 'wordloom.sqlite');
+    const before = seedVersion1(dbPath, [
+      { cardId: 'card-keel', highWater: 5 },
+      { cardId: 'card-wake', highWater: 1 },
+      { cardId: 'card-removed', highWater: 9 },
+    ]);
+    const db = openDatabase(dbPath);
+    try {
+      assert.equal(schemaVersion(db), 2);
+      assert.deepEqual(learningRows(db), before);
+      assert.deepEqual(scheduleFloors(db), [
+        { card_id: 'card-keel', high_water: 5 },
+        { card_id: 'card-removed', high_water: 9 },
+        { card_id: 'card-wake', high_water: 4 },
+      ]);
+    } finally {
+      db.close();
+    }
+    const again = openDatabase(dbPath);
+    try {
+      assert.equal(schemaVersion(again), 2);
+      assert.deepEqual(learningRows(again), before);
+      assert.deepEqual(scheduleFloors(again), [
+        { card_id: 'card-keel', high_water: 5 },
+        { card_id: 'card-removed', high_water: 9 },
+        { card_id: 'card-wake', high_water: 4 },
+      ]);
+    } finally {
+      again.close();
+    }
+  });
+});
+
+const VERSION_1_SCHEMA = `
+CREATE TABLE users (
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  progress_revision INTEGER NOT NULL DEFAULT 0 CHECK (progress_revision >= 0),
+  created_at TEXT NOT NULL
+);
+CREATE TABLE word_senses (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  lemma TEXT NOT NULL,
+  part_of_speech TEXT NOT NULL,
+  meaning TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE source_occurrences (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  sense_id TEXT NOT NULL REFERENCES word_senses(id),
+  sentence TEXT NOT NULL,
+  sentence_translation TEXT,
+  eqbank_item_id TEXT,
+  eqbank_source TEXT,
+  eqbank_locator TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE learner_cards (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  sense_id TEXT NOT NULL REFERENCES word_senses(id),
+  occurrence_id TEXT NOT NULL REFERENCES source_occurrences(id),
+  created_at TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK (revision >= 1)
+);
+CREATE TABLE schedules (
+  card_id TEXT PRIMARY KEY REFERENCES learner_cards(id),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  due TEXT NOT NULL,
+  stability REAL NOT NULL,
+  difficulty REAL NOT NULL,
+  elapsed_days INTEGER NOT NULL,
+  scheduled_days INTEGER NOT NULL,
+  learning_steps INTEGER NOT NULL,
+  reps INTEGER NOT NULL,
+  lapses INTEGER NOT NULL,
+  state INTEGER NOT NULL CHECK (state IN (0, 1, 2, 3)),
+  last_review TEXT,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE review_events (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  card_id TEXT NOT NULL REFERENCES learner_cards(id),
+  grade TEXT NOT NULL CHECK (grade IN ('again', 'hard', 'good', 'easy')),
+  affects_schedule INTEGER NOT NULL CHECK (affects_schedule IN (0, 1)),
+  reviewed_at TEXT NOT NULL,
+  client_request_id TEXT NOT NULL,
+  due_before TEXT NOT NULL,
+  due_after TEXT NOT NULL,
+  state_before TEXT NOT NULL,
+  state_after TEXT NOT NULL,
+  schedule_revision_before INTEGER NOT NULL,
+  schedule_revision_after INTEGER NOT NULL,
+  stability_before REAL NOT NULL,
+  stability_after REAL NOT NULL,
+  difficulty_before REAL NOT NULL,
+  difficulty_after REAL NOT NULL,
+  scheduled_days_before INTEGER NOT NULL,
+  scheduled_days_after INTEGER NOT NULL,
+  reps_after INTEGER NOT NULL,
+  lapses_after INTEGER NOT NULL,
+  elapsed_days_after INTEGER NOT NULL,
+  learning_steps_after INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (user_id, client_request_id)
+);
+CREATE TABLE idempotency_keys (
+  user_id TEXT NOT NULL REFERENCES users(id),
+  key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  status_code INTEGER NOT NULL,
+  response_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, key)
+);
+`;
+
+function seedVersion1(path: string, floors?: Array<{ cardId: string; highWater: number }>): ReturnType<typeof learningRows> {
+  const db = new DatabaseSync(path);
+  db.exec('PRAGMA foreign_keys = ON');
+  db.exec(VERSION_1_SCHEMA);
+  db.exec('CREATE TABLE schema_migrations (version INTEGER NOT NULL)');
+  db.prepare('INSERT INTO schema_migrations (version) VALUES (1)').run();
+  const createdAt = '2026-04-01T00:00:00.000Z';
+  db.prepare('INSERT INTO users (id, email, password_hash, progress_revision, created_at) VALUES (?, ?, ?, ?, ?)').run(
+    'user-1',
+    'keel@example.com',
+    'scrypt$placeholder',
+    4,
+    createdAt,
+  );
+  db.prepare('INSERT INTO word_senses (id, user_id, lemma, part_of_speech, meaning, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(
+    'sense-1',
+    'user-1',
+    'keel',
+    'noun',
+    'a synthetic sense for keel',
+    createdAt,
+  );
+  db.prepare(
+    'INSERT INTO source_occurrences (id, user_id, sense_id, sentence, sentence_translation, eqbank_item_id, eqbank_source, eqbank_locator, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  ).run('occurrence-1', 'user-1', 'sense-1', 'The keel held.', null, null, null, null, createdAt);
+  db.prepare('INSERT INTO learner_cards (id, user_id, sense_id, occurrence_id, created_at, revision) VALUES (?, ?, ?, ?, ?, ?)').run(
+    'card-keel',
+    'user-1',
+    'sense-1',
+    'occurrence-1',
+    createdAt,
+    1,
+  );
+  db.prepare('INSERT INTO learner_cards (id, user_id, sense_id, occurrence_id, created_at, revision) VALUES (?, ?, ?, ?, ?, ?)').run(
+    'card-wake',
+    'user-1',
+    'sense-1',
+    'occurrence-1',
+    createdAt,
+    1,
+  );
+  insertScheduleRow(db, 'card-keel', 3);
+  insertScheduleRow(db, 'card-wake', 4);
+  db.prepare(
+    `INSERT INTO review_events (
+      id, user_id, card_id, grade, affects_schedule, reviewed_at, client_request_id,
+      due_before, due_after, state_before, state_after, schedule_revision_before, schedule_revision_after,
+      stability_before, stability_after, difficulty_before, difficulty_after,
+      scheduled_days_before, scheduled_days_after, reps_after, lapses_after, elapsed_days_after, learning_steps_after,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    'event-1',
+    'user-1',
+    'card-keel',
+    'good',
+    1,
+    createdAt,
+    'request-1',
+    createdAt,
+    createdAt,
+    'new',
+    'review',
+    1,
+    2,
+    1,
+    2,
+    5,
+    5,
+    0,
+    1,
+    1,
+    0,
+    0,
+    0,
+    createdAt,
+  );
+  db.prepare('INSERT INTO idempotency_keys (user_id, key, request_hash, status_code, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(
+    'user-1',
+    'key-1',
+    'hash-1',
+    201,
+    '{}',
+    createdAt,
+  );
+  if (floors) {
+    db.exec(`CREATE TABLE schedule_generation (
+      user_id TEXT NOT NULL REFERENCES users(id),
+      card_id TEXT NOT NULL,
+      high_water INTEGER NOT NULL CHECK (high_water >= 1),
+      PRIMARY KEY (user_id, card_id)
+    )`);
+    const insertFloor = db.prepare('INSERT INTO schedule_generation (user_id, card_id, high_water) VALUES (?, ?, ?)');
+    for (const floor of floors) {
+      insertFloor.run('user-1', floor.cardId, floor.highWater);
+    }
+  }
+  const rows = learningRows(db);
+  db.close();
+  return rows;
+}
+
+function insertScheduleRow(db: DatabaseSync, cardId: string, revision: number): void {
+  db.prepare(
+    `INSERT INTO schedules (
+      card_id, user_id, due, stability, difficulty, elapsed_days, scheduled_days, learning_steps,
+      reps, lapses, state, last_review, revision, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(cardId, 'user-1', '2026-04-02T00:00:00.000Z', 1.5, 5, 0, 1, 0, 1, 0, 1, '2026-04-01T00:00:00.000Z', revision, '2026-04-01T00:00:00.000Z');
+}
+
+function schemaVersion(db: DatabaseSync): number {
+  const row = db.prepare('SELECT version FROM schema_migrations').get() as { version: number | bigint };
+  return Number(row.version);
+}
+
+function scheduleFloors(db: DatabaseSync): Array<{ card_id: string; high_water: number }> {
+  const rows = db.prepare('SELECT card_id, high_water FROM schedule_generation ORDER BY card_id').all() as Array<{
+    card_id: string;
+    high_water: number | bigint;
+  }>;
+  return rows.map((row) => ({ card_id: row.card_id, high_water: Number(row.high_water) }));
+}
+
+function learningRows(db: DatabaseSync): unknown {
+  const read = (sql: string) => db.prepare(sql).all();
+  return normalizeSql([
+    read('SELECT id, email, progress_revision FROM users ORDER BY id'),
+    read('SELECT id, lemma, meaning FROM word_senses ORDER BY id'),
+    read('SELECT id, sentence FROM source_occurrences ORDER BY id'),
+    read('SELECT id, revision FROM learner_cards ORDER BY id'),
+    read('SELECT card_id, revision, due, stability, state FROM schedules ORDER BY card_id'),
+    read('SELECT id, grade, client_request_id FROM review_events ORDER BY id'),
+    read('SELECT key, status_code FROM idempotency_keys ORDER BY key'),
+  ]);
+}
+
+function normalizeSql(value: unknown): unknown {
+  return JSON.parse(JSON.stringify(value, (_key, item: unknown) => (typeof item === 'bigint' ? Number(item) : item)));
+}
+
+function sampleCard(lemma: string, sentence: string): Record<string, string> {
+  return {
+    lemma,
+    partOfSpeech: 'noun',
+    meaning: `a synthetic sense for ${lemma}`,
+    sentence,
+  };
+}
+
+function idempotencyCount(dbPath: string, userId: string): number {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const row = db.prepare('SELECT COUNT(*) AS n FROM idempotency_keys WHERE user_id = ?').get(userId) as { n: number | bigint };
+    return Number(row.n);
+  } finally {
+    db.close();
+  }
+}
 
 function envFromCommand(command: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};

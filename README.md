@@ -5,7 +5,7 @@ Shared vocabulary accounts. Phone and desktop are two cookie sessions of one acc
 ## Plan
 
 - Fresh MIT server. Do not fork Vocably and do not copy AGPL code.
-- One account, many sessions. Scheduling runs only on the server (`ts-fsrs`, fuzz off) so two devices cannot diverge.
+- One account, many sessions. Scheduling runs only on the server (FSRS 6, package `ts-fsrs` 5.4.2, fuzz off) so two devices cannot diverge.
 - Separate word senses, source sentences, learner cards, and schedules. A review stores the original sentence and the chosen meaning.
 - Review events are append-only. A practice review (`affectsSchedule: false`) is recorded and does not move the due date.
 - Manual add, versioned JSON export, and replace or merge restore. Optional `eqbank` fields are stored metadata only. This server does not call Eqbank.
@@ -22,7 +22,7 @@ npm test
 npm run build:web
 ```
 
-`npm test` compiles the API with `tsc` and runs `node --test --test-concurrency=1 dist/test/api.test.js`. That includes the HTTP check that `Origin: http://127.0.0.1:5173` can use the explicit dev API policy. The test listens on an ephemeral port on `127.0.0.1`, so it does not need ports 8787 or 5173. It does not open a browser.
+`npm test` compiles the API with `tsc` and runs `node --test --test-concurrency=1 dist/test/api.test.js dist/test/clientSync.test.js`. That includes the HTTP check that `Origin: http://127.0.0.1:5173` can use the explicit dev API policy. The test listens on an ephemeral port on `127.0.0.1`, so it does not need ports 8787 or 5173. It does not open a browser.
 
 `npm run build:web` typechecks and builds the client with Vite. It does not start a server.
 
@@ -64,7 +64,13 @@ Set `WORDLOOM_API` only when the API is not at `http://127.0.0.1:8787`. Vite bin
 
 ## Manual browser QA
 
-Unverified. The environment used to prepare this source archive blocks browser access to the local app, so the UI was not exercised in a browser here. That is not a ban on supported browsers. Where a supported browser can open `http://127.0.0.1:5173`, manual QA and `npm run test:ui` are available. Do not add `--no-sandbox` or any other flag that bypasses browser restrictions or security. This archive was checked with `npm test` and `npm run build:web` only.
+Firefox on this machine opened `http://127.0.0.1:5173` for the checks below. That Firefox is a supported browser for this app. Managed Chromium still blocks loopback access; leave that block in place. Do not add `--no-sandbox` or any other flag that bypasses browser restrictions or security. `npm run test:ui` was not run for this pass.
+
+Auth and basic learning in that Firefox session: the desktop auth form at about 1188px; login and register at 390×844 with the preview hidden and no horizontal clipping; an empty submit stopped on the required email and returned focus there; keyboard order was email, password, submit, then the mode switch, with a visible focus ring; Enter switched modes. A synthetic local account saved one card. The library showed that card’s part of speech, meaning, and sentence. Review revealed the meaning and the four grade choices. At 390px those grades were a 2×2 grid above the bottom navigation. Stopping the API left one review pending and the screen usable; after the API was started again, the retry cleared that write, moved the account revision, and took the card out of the due queue. History showed that one review. The same card came back on its own when its due time arrived, with no refresh and no further grade. A second tab in the same Firefox profile showed a later grade and the new revision on its own. That check is same-browser, same-account sync.
+
+Node regressions are a separate run. That pass recorded `npm test` with 47 passing tests and `npm run build:web`. Those commands do not open a browser.
+
+Still unchecked in the browser: the `test:ui` script, a cross-account race on screen, backup restore in the UI, speech output, a review whose response body is lost after the server has committed it, and two independent devices.
 
 ## API
 
@@ -76,6 +82,7 @@ Unverified. The environment used to prepare this source archive blocks browser a
 | POST | `/api/auth/login` | 200, same cookies |
 | POST | `/api/auth/logout` | Revokes that session only |
 | GET | `/api/auth/me` | User id, email, `progressRevision` |
+| GET | `/api/library` | One snapshot: user, cards, due queue, senses, and review events. Requires `X-Wordloom-Owner` |
 | POST | `/api/cards` | New sense, or `senseId` plus another sentence |
 | GET | `/api/cards`, `/api/cards/:id` | Card, sense, occurrence, schedule |
 | POST | `/api/cards/:id/reviews` | Grade `again`, `hard`, `good`, or `easy` |
@@ -85,8 +92,8 @@ Unverified. The environment used to prepare this source archive blocks browser a
 | GET | `/api/backup` | Schema version 1 |
 | POST | `/api/backup/restore` | `replace` (confirm `"replace"`) or `merge` |
 
-Unsafe authenticated requests send `X-CSRF-Token` equal to `wl_csrf`. Card create, review, and restore also send `Idempotency-Key` (`8–80` letters, digits, `_`, or `-`). The same key and body returns the first response with `Idempotency-Replayed: true`. The same key and a different body returns `409 IDEMPOTENCY_CONFLICT`. A review whose `expectedScheduleRevision` is stale returns `409 REVISION_CONFLICT`. A cookie change from a disallowed origin returns `403 ORIGIN_REJECTED` and sets no cookie. A rate-limited auth or CSRF setup call returns `429 RATE_LIMITED` with `Retry-After` and sets no cookie.
+Unsafe authenticated requests send `X-CSRF-Token` equal to `wl_csrf`. Card create, review, and restore also send `Idempotency-Key` (`8–80` letters, digits, `_`, or `-`) and `X-Wordloom-Owner` set to the account id that queued the write. Inside that write transaction the server re-reads the session and returns `409 OWNER_MISMATCH` when the header is a different account, or `400 VALIDATION` when the header is missing. The same key and body returns the first response with `Idempotency-Replayed: true`. The same key and a different body returns `409 IDEMPOTENCY_CONFLICT`. A review whose `expectedScheduleRevision` is stale returns `409 REVISION_CONFLICT`. A cookie change from a disallowed origin returns `403 ORIGIN_REJECTED` and sets no cookie. A rate-limited auth or CSRF setup call returns `429 RATE_LIMITED` with `Retry-After` and sets no cookie.
 
-Backup documents use `schemaVersion: 1`. A replace restore deletes that account's learning rows and idempotency keys, then inserts the snapshot. Replaying the same restore key does not delete work added after the first restore. Ids owned by another account are rejected before any delete.
+Backup documents use `schemaVersion: 1`. A replace restore deletes that account's learning rows, keeps idempotency receipts, then inserts the snapshot. `progressRevision` becomes one greater than both the live revision and the snapshot revision. Each restored schedule keeps the snapshot's due time and FSRS fields, and its `revision` becomes one greater than the live schedule revision, the snapshot revision, and any revision that card already used. That floor survives deleting the card, so a later replace cannot revive a revision an uncommitted review still expects. Replaying a key whose write already committed does not apply it again, including after a later replace. Ids owned by another account are rejected before any delete. The client applies `GET /api/library` only when that snapshot's user is the account named by `X-Wordloom-Owner`.
 
 Synthetic examples only. No dictionary corpus and no remote account service.
