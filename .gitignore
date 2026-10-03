@@ -1,0 +1,15 @@
+node_modules/
+dist/
+data/
+release/
+coverage/
+test-results/
+playwright-report/
+blob-report/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+*.tsbuildinfo
+.env
+.env.*
