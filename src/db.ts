@@ -1,4 +1,5 @@
 import { DatabaseSync, type StatementResultingChanges } from 'node:sqlite';
+import { applySenseRecognition } from './migrateSense.js';
 
 const SCHEMA = `
 CREATE TABLE users (
@@ -96,6 +97,8 @@ CREATE TABLE review_events (
   elapsed_days_after INTEGER NOT NULL,
   learning_steps_after INTEGER NOT NULL,
   created_at TEXT NOT NULL,
+  task_id TEXT,
+  occurrence_id TEXT,
   UNIQUE (user_id, client_request_id)
 );
 
@@ -128,15 +131,100 @@ CREATE INDEX idx_occurrences_sense ON source_occurrences(user_id, sense_id);
 CREATE INDEX idx_cards_user ON learner_cards(user_id, created_at);
 CREATE INDEX idx_schedules_due ON schedules(user_id, due);
 CREATE INDEX idx_events_card ON review_events(user_id, card_id, created_at);
+
+CREATE TABLE schedule_archives (
+  user_id TEXT NOT NULL REFERENCES users(id),
+  card_id TEXT NOT NULL,
+  due TEXT NOT NULL,
+  stability REAL NOT NULL,
+  difficulty REAL NOT NULL,
+  elapsed_days INTEGER NOT NULL,
+  scheduled_days INTEGER NOT NULL,
+  learning_steps INTEGER NOT NULL,
+  reps INTEGER NOT NULL,
+  lapses INTEGER NOT NULL,
+  state INTEGER NOT NULL CHECK (state IN (0, 1, 2, 3)),
+  last_review TEXT,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  updated_at TEXT NOT NULL,
+  policy TEXT NOT NULL,
+  PRIMARY KEY (user_id, card_id)
+);
+
+CREATE TABLE learning_tasks (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  sense_id TEXT NOT NULL REFERENCES word_senses(id),
+  task_type TEXT NOT NULL CHECK (task_type = 'recognition'),
+  policy TEXT NOT NULL,
+  donor_card_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (user_id, sense_id, task_type)
+);
+
+CREATE TABLE task_members (
+  user_id TEXT NOT NULL REFERENCES users(id),
+  task_id TEXT NOT NULL REFERENCES learning_tasks(id),
+  card_id TEXT NOT NULL REFERENCES learner_cards(id),
+  PRIMARY KEY (user_id, card_id)
+);
+
+CREATE TABLE task_schedules (
+  task_id TEXT PRIMARY KEY REFERENCES learning_tasks(id),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  due TEXT NOT NULL,
+  stability REAL NOT NULL,
+  difficulty REAL NOT NULL,
+  elapsed_days INTEGER NOT NULL,
+  scheduled_days INTEGER NOT NULL,
+  learning_steps INTEGER NOT NULL,
+  reps INTEGER NOT NULL,
+  lapses INTEGER NOT NULL,
+  state INTEGER NOT NULL CHECK (state IN (0, 1, 2, 3)),
+  last_review TEXT,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  updated_at TEXT NOT NULL,
+  donor_card_id TEXT NOT NULL,
+  policy TEXT NOT NULL
+);
+
+CREATE TABLE task_rotation (
+  task_id TEXT PRIMARY KEY REFERENCES learning_tasks(id),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  occurrence_id TEXT NOT NULL,
+  UNIQUE (user_id, task_id)
+);
+
+CREATE TABLE task_generation (
+  user_id TEXT NOT NULL REFERENCES users(id),
+  task_id TEXT NOT NULL,
+  high_water INTEGER NOT NULL CHECK (high_water >= 1),
+  PRIMARY KEY (user_id, task_id)
+);
+
+CREATE TABLE alias_tombstones (
+  user_id TEXT NOT NULL REFERENCES users(id),
+  card_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  PRIMARY KEY (user_id, card_id)
+);
+
+CREATE INDEX idx_task_members_task ON task_members(user_id, task_id);
+CREATE INDEX idx_task_schedules_due ON task_schedules(user_id, due);
 `;
 
 export function openDatabase(path: string): DatabaseSync {
   const db = new DatabaseSync(path);
-  db.exec('PRAGMA foreign_keys = ON');
-  db.exec('PRAGMA busy_timeout = 5000');
-  db.exec('PRAGMA journal_mode = WAL');
-  migrate(db);
-  return db;
+  try {
+    db.exec('PRAGMA foreign_keys = ON');
+    db.exec('PRAGMA busy_timeout = 5000');
+    db.exec('PRAGMA journal_mode = WAL');
+    migrate(db);
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 }
 
 function migrate(db: DatabaseSync): void {
@@ -147,7 +235,7 @@ function migrate(db: DatabaseSync): void {
     const version = row ? Number(row.version) : 0;
     if (version === 0) {
       db.exec(SCHEMA);
-      db.prepare('INSERT INTO schema_migrations (version) VALUES (2)').run();
+      db.prepare('INSERT INTO schema_migrations (version) VALUES (3)').run();
       return;
     }
     if (version === 1) {
@@ -162,10 +250,13 @@ function migrate(db: DatabaseSync): void {
         SELECT user_id, card_id, revision FROM schedules WHERE true
         ON CONFLICT(user_id, card_id) DO UPDATE SET
           high_water = max(schedule_generation.high_water, excluded.high_water)`);
-      db.prepare('UPDATE schema_migrations SET version = 2').run();
+    }
+    if (version === 1 || version === 2) {
+      applySenseRecognition(db);
+      db.prepare('UPDATE schema_migrations SET version = 3').run();
       return;
     }
-    if (version !== 2) {
+    if (version !== 3) {
       throw new Error(`Unsupported wordloom schema version ${version}.`);
     }
   });

@@ -12,7 +12,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/index.js",
     "start:dev": "HOST=127.0.0.1 PORT=8787 WORDLOOM_ALLOWED_ORIGINS=http://127.0.0.1:5173 node dist/src/index.js",
-    "test": "tsc -p tsconfig.json && node --test --test-concurrency=1 dist/test/api.test.js dist/test/clientSync.test.js",
+    "test": "tsc -p tsconfig.json && node --test --test-concurrency=1 dist/test/api.test.js dist/test/clientSync.test.js dist/test/senseRecognition.test.js",
     "build:web": "npm run build --prefix web",
     "test:ui": "node --test --test-concurrency=1 test/ui.mjs"
   },

@@ -392,7 +392,7 @@ describe('wordloom backend', { concurrency: 1 }, () => {
       { csrf: 'session', idempotencyKey: randomUUID() },
     );
     const backup = await api(app.base, second, 'GET', '/api/backup');
-    assert.equal(backup.json.schemaVersion, 1);
+    assert.equal(backup.json.schemaVersion, 2);
     assert.equal(backup.json.cards.length, 1);
     assert.equal(backup.json.reviewEvents.length, 1);
     assert.equal(backup.json.occurrences[0].sentence, 'The sounding line read six fathom.');
@@ -477,7 +477,7 @@ describe('wordloom backend', { concurrency: 1 }, () => {
     assert.equal(rolledBack.json.items[0].card.id, cardId);
 
     const newer = structuredClone(backup.json);
-    newer.schemaVersion = 2;
+    newer.schemaVersion = 99;
     const rejected = await api(
       app.base,
       first,
@@ -1443,14 +1443,16 @@ describe('owner header, due clock, and restore receipts', { concurrency: 1 }, ()
       assert.equal(reviewed.status, 201);
       assert.equal(reviewed.json.schedule.revision, 2);
       const empty = {
-        schemaVersion: backup.json.schemaVersion,
-        exportedAt: backup.json.exportedAt,
-        progressRevision: backup.json.progressRevision,
+        ...backup.json,
         senses: [],
         occurrences: [],
         cards: [],
         schedules: [],
         reviewEvents: [],
+        tasks: [],
+        members: [],
+        legacySchedules: [],
+        rotations: [],
       };
       const wiped = await api(app.base, jar, 'POST', '/api/backup/restore', { mode: 'replace', confirm: 'replace', document: empty }, {
         csrf: 'session',
@@ -1513,12 +1515,41 @@ describe('schema migration', () => {
     const before = seedVersion1(dbPath);
     const db = openDatabase(dbPath);
     try {
-      assert.equal(schemaVersion(db), 2);
-      assert.deepEqual(learningRows(db), before);
+      assert.equal(schemaVersion(db), 3);
+      const migrated = learningRows(db) as unknown[][];
+      const prior = before as unknown[][];
+      assert.equal((migrated[0] as Array<{ progress_revision: number }>)[0]?.progress_revision, 5);
+      assert.deepEqual(migrated.slice(1), prior.slice(1));
       assert.deepEqual(scheduleFloors(db), [
-        { card_id: 'card-keel', high_water: 3 },
-        { card_id: 'card-wake', high_water: 4 },
+        { card_id: 'card-keel', high_water: 5 },
+        { card_id: 'card-wake', high_water: 5 },
       ]);
+      const active = db.prepare('SELECT revision, due, stability, donor_card_id FROM task_schedules').get() as {
+        revision: number | bigint;
+        due: string;
+        stability: number;
+        donor_card_id: string;
+      };
+      assert.equal(Number(active.revision), 5);
+      assert.equal(active.donor_card_id, 'card-keel');
+      assert.equal(active.due, '2026-04-02T00:00:00.000Z');
+      assert.equal(active.stability, 1.5);
+      const event = db.prepare('SELECT id, card_id, grade, schedule_revision_before, schedule_revision_after, task_id, occurrence_id FROM review_events').get() as {
+        id: string;
+        card_id: string;
+        grade: string;
+        schedule_revision_before: number | bigint;
+        schedule_revision_after: number | bigint;
+        task_id: string | null;
+        occurrence_id: string | null;
+      };
+      assert.equal(event.id, 'event-1');
+      assert.equal(event.card_id, 'card-keel');
+      assert.equal(event.grade, 'good');
+      assert.equal(Number(event.schedule_revision_before), 1);
+      assert.equal(Number(event.schedule_revision_after), 2);
+      assert.equal(event.task_id, null);
+      assert.equal(event.occurrence_id, null);
     } finally {
       db.close();
     }
@@ -1534,24 +1565,38 @@ describe('schema migration', () => {
     ]);
     const db = openDatabase(dbPath);
     try {
-      assert.equal(schemaVersion(db), 2);
-      assert.deepEqual(learningRows(db), before);
+      assert.equal(schemaVersion(db), 3);
+      const migrated = learningRows(db) as unknown[][];
+      const prior = before as unknown[][];
+      assert.equal((migrated[0] as Array<{ progress_revision: number }>)[0]?.progress_revision, 5);
+      assert.deepEqual(migrated.slice(1), prior.slice(1));
       assert.deepEqual(scheduleFloors(db), [
-        { card_id: 'card-keel', high_water: 5 },
+        { card_id: 'card-keel', high_water: 6 },
         { card_id: 'card-removed', high_water: 9 },
-        { card_id: 'card-wake', high_water: 4 },
+        { card_id: 'card-wake', high_water: 6 },
       ]);
+      const active = db.prepare('SELECT revision, stability, donor_card_id FROM task_schedules').get() as {
+        revision: number | bigint;
+        stability: number;
+        donor_card_id: string;
+      };
+      assert.equal(Number(active.revision), 6);
+      assert.equal(active.donor_card_id, 'card-keel');
+      assert.equal(active.stability, 1.5);
     } finally {
       db.close();
     }
     const again = openDatabase(dbPath);
     try {
-      assert.equal(schemaVersion(again), 2);
-      assert.deepEqual(learningRows(again), before);
+      assert.equal(schemaVersion(again), 3);
+      const migrated = learningRows(again) as unknown[][];
+      const prior = before as unknown[][];
+      assert.equal((migrated[0] as Array<{ progress_revision: number }>)[0]?.progress_revision, 5);
+      assert.deepEqual(migrated.slice(1), prior.slice(1));
       assert.deepEqual(scheduleFloors(again), [
-        { card_id: 'card-keel', high_water: 5 },
+        { card_id: 'card-keel', high_water: 6 },
         { card_id: 'card-removed', high_water: 9 },
-        { card_id: 'card-wake', high_water: 4 },
+        { card_id: 'card-wake', high_water: 6 },
       ]);
     } finally {
       again.close();

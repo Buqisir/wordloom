@@ -1,4 +1,6 @@
-export const BACKUP_SCHEMA_VERSION = 1;
+export const BACKUP_SCHEMA_VERSION = 2;
+export const LEGACY_BACKUP_SCHEMA_VERSION = 1;
+export const TASK_POLICY = 'sense-recognition-v1';
 
 export const STATE_NAMES = ['new', 'learning', 'review', 'relearning'] as const;
 export type StateName = (typeof STATE_NAMES)[number];
@@ -35,6 +37,30 @@ export type CardJson = {
   occurrenceId: string;
   createdAt: string;
   revision: number;
+};
+
+export type ContextJson = OccurrenceJson & {
+  cardId: string;
+  cardIds: string[];
+};
+
+export type TaskJson = {
+  id: string;
+  senseId: string;
+  taskType: 'recognition';
+  policy: typeof TASK_POLICY;
+  donorCardId: string;
+  createdAt: string;
+};
+
+export type MemberJson = {
+  taskId: string;
+  cardId: string;
+};
+
+export type RotationJson = {
+  taskId: string;
+  occurrenceId: string;
 };
 
 export type ScheduleJson = {
@@ -77,6 +103,8 @@ export type ReviewEventJson = {
   elapsedDaysAfter: number;
   learningStepsAfter: number;
   createdAt: string;
+  taskId: string | null;
+  occurrenceId: string | null;
 };
 
 export type ItemJson = {
@@ -84,10 +112,14 @@ export type ItemJson = {
   sense: SenseJson;
   occurrence: OccurrenceJson;
   schedule: ScheduleJson;
+  taskId: string;
+  taskType: 'recognition';
+  contextCount: number;
+  contexts: ContextJson[];
 };
 
-export type BackupDocument = {
-  schemaVersion: typeof BACKUP_SCHEMA_VERSION;
+export type BackupDocumentV1 = {
+  schemaVersion: typeof LEGACY_BACKUP_SCHEMA_VERSION;
   exportedAt: string;
   progressRevision: number;
   senses: SenseJson[];
@@ -96,6 +128,23 @@ export type BackupDocument = {
   schedules: ScheduleJson[];
   reviewEvents: ReviewEventJson[];
 };
+
+export type BackupDocumentV2 = {
+  schemaVersion: typeof BACKUP_SCHEMA_VERSION;
+  exportedAt: string;
+  progressRevision: number;
+  senses: SenseJson[];
+  occurrences: OccurrenceJson[];
+  cards: CardJson[];
+  schedules: ScheduleJson[];
+  reviewEvents: ReviewEventJson[];
+  tasks: TaskJson[];
+  members: MemberJson[];
+  legacySchedules: ScheduleJson[];
+  rotations: RotationJson[];
+};
+
+export type BackupDocument = BackupDocumentV1 | BackupDocumentV2;
 
 export type ApiResult = {
   status: number;

@@ -13,6 +13,9 @@ export type BackupPreview = {
   cards: RowCount;
   schedules: RowCount;
   reviewEvents: RowCount;
+  tasks: RowCount;
+  legacySchedules: RowCount;
+  rotations: RowCount;
   sameSentence: number;
 };
 
@@ -27,15 +30,24 @@ export function previewBackup(raw: string, current: BackupDocument): BackupPrevi
   }
   try {
     const document = parseBackupDocument(parsed);
+    const currentTasks = current.schemaVersion === 2 ? current.tasks : [];
+    const incomingTasks = document.schemaVersion === 2 ? document.tasks : [];
+    const currentLegacy = current.schemaVersion === 2 ? current.legacySchedules : [];
+    const incomingLegacy = document.schemaVersion === 2 ? document.legacySchedules : [];
+    const currentRotations = current.schemaVersion === 2 ? current.rotations : [];
+    const incomingRotations = document.schemaVersion === 2 ? document.rotations : [];
     return {
       ok: true,
       message: '校验通过。还没有写入账户。',
-      document,
+      document: parsed as BackupDocument,
       senses: tally(current.senses, document.senses, (row) => row.id),
       occurrences: tally(current.occurrences, document.occurrences, (row) => row.id),
       cards: tally(current.cards, document.cards, (row) => row.id),
-      schedules: tally(current.schedules, document.schedules, (row) => row.cardId),
+      schedules: tally(current.schedules.map(forgetRevision), document.schedules.map(forgetRevision), (row) => row.cardId),
       reviewEvents: tally(current.reviewEvents, document.reviewEvents, (row) => row.id),
+      tasks: tally(currentTasks, incomingTasks, (row) => row.id),
+      legacySchedules: tally(currentLegacy, incomingLegacy, (row) => row.cardId),
+      rotations: tally(currentRotations, incomingRotations, (row) => row.taskId),
       sameSentence: countSameSentence(current, document),
     };
   } catch (error) {
@@ -56,8 +68,15 @@ function blank(message: string): BackupPreview {
     cards: emptyCount,
     schedules: emptyCount,
     reviewEvents: emptyCount,
+    tasks: emptyCount,
+    legacySchedules: emptyCount,
+    rotations: emptyCount,
     sameSentence: 0,
   };
+}
+
+function forgetRevision<T extends { revision: number }>(schedule: T): T {
+  return { ...schedule, revision: 0 };
 }
 
 function tally<T>(current: T[], incoming: T[], idOf: (row: T) => string): RowCount {

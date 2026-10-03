@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useMemo, useReducer, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { Cluster, Container, Heading, Stack, WithSide } from 'lism-css/react';
 import {
   classifyWriteFailure,
@@ -28,7 +28,9 @@ import {
 } from './api';
 import { previewBackup, type BackupPreview } from './backupPreview';
 import { gradeChoices, GRADE_LABEL } from './intervals';
+import { initialReplaceIntent, replaceConfirmEnabled, replaceIntentReducer } from './replaceConfirm';
 import { RevealedTranslation, reviewIntervalHint } from './reviewPrompt';
+import { ReviewContextNotes } from './senseContext';
 import type { BackupDocument, GradeName, ItemJson, ReviewEventJson, UserJson } from '../../src/types.js';
 
 type Model = {
@@ -112,16 +114,38 @@ function sessionStore(): SyncStorage {
 }
 
 function toHistory(items: ItemJson[], events: ReviewEventJson[]): HistoryRow[] {
-  const byCard = new Map(items.map((item) => [item.card.id, item]));
+  const byCard = new Map<string, { lemma: string; meaning: string; sentence: string; partOfSpeech: string }>();
+  for (const item of items) {
+    const contexts = item.contexts ?? [];
+    for (const context of contexts) {
+      const cardIds = context.cardIds?.length ? context.cardIds : [context.cardId];
+      for (const cardId of cardIds) {
+        byCard.set(cardId, {
+          lemma: item.sense.lemma,
+          meaning: item.sense.meaning,
+          sentence: context.sentence,
+          partOfSpeech: item.sense.partOfSpeech,
+        });
+      }
+    }
+    if (!byCard.has(item.card.id)) {
+      byCard.set(item.card.id, {
+        lemma: item.sense.lemma,
+        meaning: item.sense.meaning,
+        sentence: item.occurrence.sentence,
+        partOfSpeech: item.sense.partOfSpeech,
+      });
+    }
+  }
   return events
     .map((event) => {
       const item = byCard.get(event.cardId);
       return {
         ...event,
-        lemma: item?.sense.lemma ?? '',
-        meaning: item?.sense.meaning ?? '',
-        sentence: item?.occurrence.sentence ?? '',
-        partOfSpeech: item?.sense.partOfSpeech ?? '',
+        lemma: item?.lemma ?? '',
+        meaning: item?.meaning ?? '',
+        sentence: item?.sentence ?? '',
+        partOfSpeech: item?.partOfSpeech ?? '',
       };
     })
     .sort((left, right) => right.reviewedAt.localeCompare(left.reviewedAt) || right.id.localeCompare(left.id));
@@ -631,9 +655,7 @@ function AddPage() {
             </select>
           </div>
           {chosen ? (
-            <p className="meta">
-              新原句会连到义项“{chosen.meaning}”。
-            </p>
+            <p className="meta">新原句会连到义项“{chosen.meaning}”。已有复习进度保持不变。</p>
           ) : (
             <>
               <div className="field">
@@ -692,14 +714,11 @@ function AddPage() {
 function ReviewPage() {
   const model = useApp();
   const card = model.queue[0];
-  const [revealed, setRevealed] = useState(false);
+  const [openCardId, setOpenCardId] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const revealed = card !== undefined && openCardId === card.card.id;
   const choices = useMemo(() => (card ? gradeChoices(card.schedule) : []), [card]);
-
-  useEffect(() => {
-    setRevealed(false);
-  }, [card?.card.id]);
 
   if (!card) {
     return (
@@ -738,11 +757,12 @@ function ReviewPage() {
           <h2 className="headword">{card.sense.lemma}</h2>
           <p className="meta">{card.sense.partOfSpeech}</p>
           <Sentence sentence={card.occurrence.sentence} lemma={card.sense.lemma} />
+          <ReviewContextNotes item={card} revealed={revealed} />
           <SpeechButton text={card.occurrence.sentence} />
           {revealed ? (
             <p className="meaning">义项：{card.sense.meaning}</p>
           ) : (
-            <button type="button" className="button button-primary" onClick={() => setRevealed(true)}>
+            <button type="button" className="button button-primary" onClick={() => setOpenCardId(card.card.id)}>
               显示释义
             </button>
           )}
@@ -782,15 +802,30 @@ function LibraryPage() {
   const [preview, setPreview] = useState<BackupPreview | null>(null);
   const [currentCards, setCurrentCards] = useState<number | null>(null);
   const [error, setError] = useState('');
-  const [replaceOpen, setReplaceOpen] = useState(false);
-  const [confirmed, setConfirmed] = useState(false);
+  const [replaceIntent, dispatchReplace] = useReducer(replaceIntentReducer, initialReplaceIntent);
   const [busy, setBusy] = useState(false);
   const needle = query.trim().toLowerCase();
   const visible = model.items.filter((item) => {
     if (!needle) {
       return true;
     }
-    return [item.sense.lemma, item.sense.partOfSpeech, item.sense.meaning, item.occurrence.sentence]
+    const sense = model.senses.find((candidate) => candidate.id === item.sense.id);
+    const sentences = [
+      ...(item.contexts ?? []).map((context) => context.sentence),
+      item.occurrence.sentence,
+      ...(sense?.occurrences.map((occurrence) => occurrence.sentence) ?? []),
+    ];
+    return [item.sense.lemma, item.sense.partOfSpeech, item.sense.meaning, ...sentences].join('\n').toLowerCase().includes(needle);
+  });
+  const covered = new Set(model.items.map((item) => item.sense.id));
+  const emptySenses = model.senses.filter((sense) => {
+    if (covered.has(sense.id)) {
+      return false;
+    }
+    if (!needle) {
+      return true;
+    }
+    return [sense.lemma, sense.partOfSpeech, sense.meaning, ...sense.occurrences.map((occurrence) => occurrence.sentence)]
       .join('\n')
       .toLowerCase()
       .includes(needle);
@@ -798,7 +833,7 @@ function LibraryPage() {
 
   async function onFile(file: File | undefined) {
     setError('');
-    setConfirmed(false);
+    dispatchReplace({ type: 'dismiss' });
     if (!file) {
       setPreview(null);
       return;
@@ -827,8 +862,7 @@ function LibraryPage() {
     try {
       await model.restore(mode, preview.document);
       setPreview(null);
-      setReplaceOpen(false);
-      setConfirmed(false);
+      dispatchReplace({ type: 'dismiss' });
     } catch (caught) {
       setError(caught instanceof ApiError ? explainError(caught) : caught instanceof Error ? caught.message : '没有导入。');
     } finally {
@@ -846,9 +880,24 @@ function LibraryPage() {
         <input id="library-search" type="search" value={query} onChange={(event) => setQuery(event.target.value)} />
       </div>
       <p className="meta">显示 {visible.length} 张卡片。</p>
-      {visible.length === 0 ? <p>{model.items.length === 0 ? '词库是空的。' : '没有符合的卡片。'}</p> : null}
+      {visible.length === 0 && emptySenses.length === 0 ? <p>{model.items.length === 0 && model.senses.length === 0 ? '词库是空的。' : '没有符合的卡片。'}</p> : null}
       {visible.map((item) => (
-        <LinkedCard key={item.card.id} item={item} />
+        <LinkedCard key={item.card.id} item={item} senses={model.senses} />
+      ))}
+      {emptySenses.map((sense) => (
+        <article key={sense.id} className="card card-row">
+          <Stack g="10">
+            <h2 className="list-headword">{sense.lemma}</h2>
+            <p className="meta">{sense.partOfSpeech}</p>
+            <p className="meaning">义项：{sense.meaning}</p>
+            <p className="meta">还没有复习卡片。</p>
+            {sense.occurrences.map((occurrence) => (
+              <p key={occurrence.id} className="sentence">
+                {occurrence.sentence}
+              </p>
+            ))}
+          </Stack>
+        </article>
       ))}
       <Cluster g="10">
         <button type="button" className="button" onClick={() => void model.downloadBackup()}>
@@ -879,18 +928,25 @@ function LibraryPage() {
             <p>{countLine('卡片', preview.cards)}</p>
             <p>{countLine('日程', preview.schedules)}</p>
             <p>{countLine('复习记录', preview.reviewEvents)}</p>
+            {preview.document?.schemaVersion === 2 ? (
+              <>
+                <p>{countLine('识别任务', preview.tasks)}</p>
+                <p>{countLine('归档日程', preview.legacySchedules)}</p>
+                <p>{countLine('原句轮换', preview.rotations)}</p>
+              </>
+            ) : null}
             <p>不同编号但原句和释义相同：{preview.sameSentence}</p>
             <p className="hint">上面的数字是预览。合并或替换才会写入账户。</p>
             <Cluster g="10">
               <button
                 type="button"
                 className="button button-primary"
-                disabled={!preview.ok || busy || preview.cards.conflict + preview.senses.conflict + preview.occurrences.conflict > 0}
+                disabled={!preview.ok || busy || mergeBlocked(preview)}
                 onClick={() => void commit('merge')}
               >
                 合并导入
               </button>
-              <button type="button" className="button" disabled={!preview.ok || busy} onClick={() => setReplaceOpen(true)}>
+              <button type="button" className="button" disabled={!preview.ok || busy} onClick={() => dispatchReplace({ type: 'open' })}>
                 替换本账户学习记录
               </button>
             </Cluster>
@@ -902,18 +958,27 @@ function LibraryPage() {
           {error}
         </p>
       ) : null}
-      <Dialog open={replaceOpen} title="替换本账户学习记录" onClose={() => setReplaceOpen(false)}>
+      <Dialog open={replaceIntent.open} title="替换本账户学习记录" onClose={() => dispatchReplace({ type: 'dismiss' })}>
         <Stack g="12">
           <p>替换会删除本账户现有的学习记录，再写入这份备份。其他账户不受影响。</p>
           <label className="check">
-            <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
+            <input
+              type="checkbox"
+              checked={replaceIntent.confirmed}
+              onChange={(event) => dispatchReplace({ type: 'acknowledge', checked: event.target.checked })}
+            />
             我要替换本账户的学习记录
           </label>
           <Cluster g="10">
-            <button type="button" className="button button-primary" disabled={!confirmed || busy} onClick={() => void commit('replace')}>
+            <button
+              type="button"
+              className="button button-primary"
+              disabled={!replaceConfirmEnabled(replaceIntent.confirmed, busy)}
+              onClick={() => void commit('replace')}
+            >
               确认替换
             </button>
-            <button type="button" className="button" onClick={() => setReplaceOpen(false)}>
+            <button type="button" className="button" onClick={() => dispatchReplace({ type: 'dismiss' })}>
               取消
             </button>
           </Cluster>
@@ -952,7 +1017,11 @@ function HistoryPage() {
   );
 }
 
-function LinkedCard({ item }: { item: ItemJson }) {
+function LinkedCard({ item, senses }: { item: ItemJson; senses: SenseDetail[] }) {
+  const contexts = item.contexts?.length ? item.contexts : [{ ...item.occurrence, cardId: item.card.id, cardIds: [item.card.id] }];
+  const linked = new Set(contexts.map((context) => context.id));
+  const sense = senses.find((candidate) => candidate.id === item.sense.id);
+  const preserved = (sense?.occurrences ?? []).filter((occurrence) => !linked.has(occurrence.id));
   return (
     <article className="card card-row">
       <Stack g="10">
@@ -963,8 +1032,16 @@ function LinkedCard({ item }: { item: ItemJson }) {
           </div>
           <p className="meaning">义项：{item.sense.meaning}</p>
           <p className="meta">到期 {formatWhen(item.schedule.due)}</p>
+          <p className="meta">原句 {item.contextCount}</p>
         </div>
-        <Sentence sentence={item.occurrence.sentence} lemma={item.sense.lemma} />
+        {contexts.map((context) => (
+          <Sentence key={context.id} sentence={context.sentence} lemma={item.sense.lemma} />
+        ))}
+        {preserved.map((occurrence) => (
+          <p key={occurrence.id} className="meta">
+            未进入复习的原句：{occurrence.sentence}
+          </p>
+        ))}
       </Stack>
     </article>
   );
@@ -1045,6 +1122,20 @@ function Dialog({ open, title, onClose, children }: { open: boolean; title: stri
         {children}
       </Stack>
     </dialog>
+  );
+}
+
+function mergeBlocked(preview: BackupPreview): boolean {
+  return (
+    preview.senses.conflict +
+      preview.occurrences.conflict +
+      preview.cards.conflict +
+      preview.schedules.conflict +
+      preview.reviewEvents.conflict +
+      preview.tasks.conflict +
+      preview.legacySchedules.conflict +
+      preview.rotations.conflict >
+    0
   );
 }
 

@@ -566,6 +566,19 @@ describe('sync controller races', { timeout: 5000 }, () => {
     assert.equal(view.pending.length, 1);
     assert.equal(view.readError, 'retryable');
   });
+
+  it('keeps an offline existing-sense add body unchanged', async () => {
+    const fixture = harness();
+    fixture.controller.adopt(accountAUser);
+    fixture.controller.setOnline(false);
+    const body = { senseId: '11111111-1111-4111-8111-111111111111', sentence: 'The keel held the next sentence.' };
+    const pending = await fixture.controller.submit('/api/cards', body, '添加原句');
+    assert.deepEqual(pending, { pending: true, replayed: false });
+    assert.equal(fixture.sends.length, 0);
+    const stored = fixture.store.read(accountA);
+    assert.equal(stored.length, 1);
+    assert.deepEqual(stored[0]?.body, body);
+  });
 });
 
 describe('review reveal', () => {
@@ -616,6 +629,152 @@ describe('review reveal', () => {
       assert.equal(appSource.includes('译文：{card.occurrence.sentenceTranslation}'), false);
       assert.ok(appSource.includes('{reviewIntervalHint}'));
       assert.equal(appSource.includes('FSRS 5.4.2'), false);
+      assert.ok(appSource.includes('<ReviewContextNotes item={card} revealed={revealed} />'));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('hides other sentences and their translations until reveal', async () => {
+    const webRoot = fileURLToPath(new URL('../../web', import.meta.url));
+    const esbuild = (await import(pathToFileURL(join(webRoot, 'node_modules/esbuild/lib/main.js')).href)) as {
+      build: (options: Record<string, unknown>) => Promise<void>;
+    };
+    const dir = mkdtempSync(join(webRoot, 'node_modules/.wordloom-context-'));
+    try {
+      await esbuild.build({
+        stdin: {
+          contents: `
+            import { createElement } from 'react';
+            import { renderToStaticMarkup } from 'react-dom/server';
+            import { ReviewContextNotes } from './senseContext.tsx';
+            export function markup(item, revealed) {
+              return renderToStaticMarkup(createElement(ReviewContextNotes, { item, revealed }));
+            }
+          `,
+          resolveDir: join(webRoot, 'src'),
+          sourcefile: 'context-render.js',
+          loader: 'js',
+        },
+        bundle: true,
+        format: 'esm',
+        platform: 'node',
+        packages: 'external',
+        outfile: join(dir, 'render.js'),
+      });
+      const rendered = (await import(pathToFileURL(join(dir, 'render.js')).href)) as {
+        markup: (item: unknown, revealed: boolean) => string;
+      };
+      const item = {
+        occurrence: { id: 'a' },
+        contextCount: 2,
+        contexts: [
+          { id: 'a', sentence: 'The keel held.', sentenceTranslation: '龙骨译文' },
+          { id: 'b', sentence: 'The wake spread.', sentenceTranslation: '尾流译文' },
+        ],
+      };
+      const hidden = rendered.markup(item, false);
+      const shown = rendered.markup(item, true);
+      assert.match(hidden, /原句 1\/2/);
+      assert.equal(hidden.includes('The wake spread'), false);
+      assert.equal(hidden.includes('尾流译文'), false);
+      assert.equal(hidden.includes('龙骨译文'), false);
+      assert.equal(shown.includes('The wake spread.'), true);
+      assert.equal(shown.includes('尾流译文'), true);
+      assert.equal(shown.includes('The keel held.'), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('replace confirmation', () => {
+  it('starts each replace intent unchecked after cancel, escape, reopen, or a new backup', async () => {
+    const webRoot = fileURLToPath(new URL('../../web', import.meta.url));
+    const esbuild = (await import(pathToFileURL(join(webRoot, 'node_modules/esbuild/lib/main.js')).href)) as {
+      build: (options: Record<string, unknown>) => Promise<void>;
+    };
+    const dir = mkdtempSync(join(webRoot, 'node_modules/.wordloom-replace-'));
+    try {
+      await esbuild.build({
+        stdin: {
+          contents: `
+            export {
+              initialReplaceIntent,
+              replaceConfirmEnabled,
+              replaceIntentReducer,
+            } from './replaceConfirm.ts';
+          `,
+          resolveDir: join(webRoot, 'src'),
+          sourcefile: 'replace-confirm.js',
+          loader: 'js',
+        },
+        bundle: true,
+        format: 'esm',
+        platform: 'node',
+        packages: 'external',
+        outfile: join(dir, 'replace.js'),
+      });
+      const replace = (await import(pathToFileURL(join(dir, 'replace.js')).href)) as {
+        initialReplaceIntent: { open: boolean; confirmed: boolean };
+        replaceConfirmEnabled: (confirmed: boolean, busy: boolean) => boolean;
+        replaceIntentReducer: (
+          state: { open: boolean; confirmed: boolean },
+          action: { type: 'open' } | { type: 'dismiss' } | { type: 'acknowledge'; checked: boolean },
+        ) => { open: boolean; confirmed: boolean };
+      };
+      const open = { type: 'open' } as const;
+      const dismiss = { type: 'dismiss' } as const;
+      const check = { type: 'acknowledge', checked: true } as const;
+      let intent = replace.initialReplaceIntent;
+      assert.deepEqual(intent, { open: false, confirmed: false });
+      assert.equal(replace.replaceConfirmEnabled(intent.confirmed, false), false);
+
+      intent = replace.replaceIntentReducer(intent, open);
+      intent = replace.replaceIntentReducer(intent, check);
+      assert.equal(replace.replaceConfirmEnabled(intent.confirmed, false), true);
+      assert.equal(replace.replaceConfirmEnabled(intent.confirmed, true), false);
+
+      intent = replace.replaceIntentReducer(intent, dismiss);
+      intent = replace.replaceIntentReducer(intent, open);
+      assert.deepEqual(intent, { open: true, confirmed: false });
+      assert.equal(replace.replaceConfirmEnabled(intent.confirmed, false), false);
+
+      intent = replace.replaceIntentReducer(intent, check);
+      intent = replace.replaceIntentReducer(intent, dismiss);
+      intent = replace.replaceIntentReducer(intent, open);
+      assert.deepEqual(intent, { open: true, confirmed: false });
+
+      intent = replace.replaceIntentReducer(intent, check);
+      intent = replace.replaceIntentReducer(intent, dismiss);
+      assert.deepEqual(intent, { open: false, confirmed: false });
+
+      intent = replace.replaceIntentReducer(replace.initialReplaceIntent, check);
+      intent = replace.replaceIntentReducer(intent, open);
+      assert.deepEqual(intent, { open: true, confirmed: false });
+
+      intent = replace.replaceIntentReducer(intent, check);
+      assert.deepEqual(intent, { open: true, confirmed: true });
+      assert.equal(replace.replaceConfirmEnabled(intent.confirmed, false), true);
+
+      const appSource = readFileSync(join(webRoot, 'src/app.tsx'), 'utf8');
+      const libraryStart = appSource.indexOf('function LibraryPage()');
+      const libraryEnd = appSource.indexOf('function HistoryPage()');
+      const library = appSource.slice(libraryStart, libraryEnd);
+      const commitStart = library.indexOf('async function commit');
+      const commitEnd = library.indexOf('return (', commitStart);
+      const commit = library.slice(commitStart, commitEnd);
+      const failure = commit.slice(commit.indexOf('} catch'), commit.indexOf('} finally'));
+      assert.equal(library.includes('setReplaceOpen'), false);
+      assert.equal(library.includes('setConfirmed'), false);
+      assert.equal(library.split("dispatchReplace({ type: 'dismiss' })").length - 1, 4);
+      assert.equal(library.split("dispatchReplace({ type: 'open' })").length - 1, 1);
+      assert.ok(library.includes("onClose={() => dispatchReplace({ type: 'dismiss' })}"));
+      assert.ok(library.includes("onClick={() => dispatchReplace({ type: 'dismiss' })}"));
+      assert.ok(library.includes('disabled={!replaceConfirmEnabled(replaceIntent.confirmed, busy)}'));
+      assert.ok(commit.includes("dispatchReplace({ type: 'dismiss' })"));
+      assert.equal(failure.includes('dispatchReplace'), false);
+      assert.ok(library.slice(library.indexOf('async function onFile'), commitStart).includes("dispatchReplace({ type: 'dismiss' })"));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

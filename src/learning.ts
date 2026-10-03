@@ -6,17 +6,19 @@ import { canonicalJson } from './crypto.js';
 import { changesOf, transaction } from './db.js';
 import { HttpError } from './errors.js';
 import { emptySchedule, scheduleAfterGrade, stateName, stateValue, toScheduleJson, type StoredSchedule } from './scheduler.js';
+import { nextContextId, recognitionTaskId } from './senseTask.js';
 import type {
   ApiResult,
+  ContextJson,
   EqbankMeta,
   GradeName,
   ItemJson,
   OccurrenceJson,
   ReviewEventJson,
-  ScheduleJson,
   SenseJson,
   StateName,
 } from './types.js';
+import { TASK_POLICY } from './types.js';
 import { parseManualAdd, parseReview } from './validate.js';
 
 type IdempotencyRow = { request_hash: string; status_code: number; response_json: string };
@@ -60,42 +62,43 @@ type EventRow = {
   elapsed_days_after: number;
   learning_steps_after: number;
   created_at: string;
+  task_id: string | null;
+  occurrence_id: string | null;
 };
 
-const ITEM_SQL = `
-SELECT
-  c.id AS card_id,
-  c.sense_id AS sense_id,
-  c.occurrence_id AS occurrence_id,
-  c.created_at AS card_created_at,
-  c.revision AS card_revision,
-  s.lemma AS lemma,
-  s.part_of_speech AS part_of_speech,
-  s.meaning AS meaning,
-  s.created_at AS sense_created_at,
-  o.sentence AS sentence,
-  o.sentence_translation AS sentence_translation,
-  o.eqbank_item_id AS eqbank_item_id,
-  o.eqbank_source AS eqbank_source,
-  o.eqbank_locator AS eqbank_locator,
-  o.created_at AS occurrence_created_at,
-  sch.due AS due,
-  sch.stability AS stability,
-  sch.difficulty AS difficulty,
-  sch.elapsed_days AS elapsed_days,
-  sch.scheduled_days AS scheduled_days,
-  sch.learning_steps AS learning_steps,
-  sch.reps AS reps,
-  sch.lapses AS lapses,
-  sch.state AS state,
-  sch.last_review AS last_review,
-  sch.revision AS schedule_revision,
-  sch.updated_at AS schedule_updated_at
-FROM learner_cards c
-JOIN word_senses s ON s.id = c.sense_id AND s.user_id = c.user_id
-JOIN source_occurrences o ON o.id = c.occurrence_id AND o.user_id = c.user_id AND o.sense_id = c.sense_id
-JOIN schedules sch ON sch.card_id = c.id AND sch.user_id = c.user_id
-`;
+type MemberRow = {
+  task_id: string;
+  task_type: 'recognition';
+  donor_card_id: string;
+  card_id: string;
+  card_revision: number | bigint;
+  card_created_at: string;
+  sense_id: string;
+  lemma: string;
+  part_of_speech: string;
+  meaning: string;
+  sense_created_at: string;
+  occurrence_id: string;
+  sentence: string;
+  sentence_translation: string | null;
+  eqbank_item_id: string | null;
+  eqbank_source: string | null;
+  eqbank_locator: string | null;
+  occurrence_created_at: string;
+  due: string;
+  stability: number | bigint;
+  difficulty: number | bigint;
+  elapsed_days: number | bigint;
+  scheduled_days: number | bigint;
+  learning_steps: number | bigint;
+  reps: number | bigint;
+  lapses: number | bigint;
+  state: number | bigint;
+  last_review: string | null;
+  schedule_revision: number | bigint;
+  schedule_updated_at: string;
+  rotation_occurrence_id: string;
+};
 
 export function createCard(
   db: DatabaseSync,
@@ -120,7 +123,6 @@ export function createCard(
     }
     const occurrenceId = randomUUID();
     const cardId = randomUUID();
-    const schedule = emptySchedule(instantDate);
     db.prepare(
       `INSERT INTO source_occurrences (
         id, user_id, sense_id, sentence, sentence_translation, eqbank_item_id, eqbank_source, eqbank_locator, created_at
@@ -139,8 +141,20 @@ export function createCard(
     db.prepare(
       'INSERT INTO learner_cards (id, user_id, sense_id, occurrence_id, created_at, revision) VALUES (?, ?, ?, ?, ?, 1)',
     ).run(cardId, userId, senseId, occurrenceId, instant);
-    insertSchedule(db, userId, cardId, schedule, 1, instant);
-    raiseScheduleFloor(db, userId, cardId, 1);
+    if (input.kind === 'new-sense') {
+      beginRecognition(db, userId, senseId, cardId, occurrenceId, instantDate, instant);
+    } else {
+      const task = db.prepare('SELECT id FROM learning_tasks WHERE user_id = ? AND sense_id = ? AND task_type = ?').get(
+        userId,
+        senseId,
+        'recognition',
+      ) as { id: string } | undefined;
+      if (!task) {
+        beginRecognition(db, userId, senseId, cardId, occurrenceId, instantDate, instant);
+      } else {
+        db.prepare('INSERT INTO task_members (user_id, task_id, card_id) VALUES (?, ?, ?)').run(userId, task.id, cardId);
+      }
+    }
     const progressRevision = bumpProgress(db, userId);
     const response = { item: requireItem(db, userId, cardId), progressRevision };
     saveIdempotent(db, userId, key, requestHash, 201, response, instant);
@@ -149,8 +163,7 @@ export function createCard(
 }
 
 export function listItems(db: DatabaseSync, userId: string): ItemJson[] {
-  const rows = db.prepare(`${ITEM_SQL} WHERE c.user_id = ? ORDER BY c.created_at ASC, c.id ASC`).all(userId);
-  return rows.map((row) => toItem(row as Record<string, unknown>));
+  return projectItems(db, userId, undefined);
 }
 
 export function getItem(db: DatabaseSync, userId: string, cardId: string): ItemJson {
@@ -161,7 +174,7 @@ export function listQueue(db: DatabaseSync, userId: string, now: Date): ItemJson
   const nowMs = now.getTime();
   return listItems(db, userId)
     .filter((item) => isDue(item.schedule.due, nowMs))
-    .sort((left, right) => left.schedule.due.localeCompare(right.schedule.due) || left.card.id.localeCompare(right.card.id));
+    .sort((left, right) => left.schedule.due.localeCompare(right.schedule.due) || left.taskId.localeCompare(right.taskId));
 }
 
 export function listAccountEvents(db: DatabaseSync, userId: string): ReviewEventJson[] {
@@ -207,8 +220,21 @@ export function reviewCard(
 ): ApiResult {
   return runOwnedMutation(db, now, sessionId, expectedOwner, key, requestHash, (userId) => {
     const review = parseReview(body);
-    const row = db.prepare('SELECT * FROM schedules WHERE card_id = ? AND user_id = ?').get(cardId, userId) as ScheduleRow | undefined;
-    if (!row || !db.prepare('SELECT id FROM learner_cards WHERE id = ? AND user_id = ?').get(cardId, userId)) {
+    const owned = db.prepare('SELECT occurrence_id FROM learner_cards WHERE id = ? AND user_id = ?').get(cardId, userId) as
+      | { occurrence_id: string }
+      | undefined;
+    if (!owned) {
+      throw new HttpError(404, 'NOT_FOUND', 'Card not found.');
+    }
+    if (review.occurrenceId !== undefined && review.occurrenceId !== owned.occurrence_id) {
+      throw new HttpError(400, 'VALIDATION', 'occurrenceId does not match the card in this request.');
+    }
+    const task = taskForCard(db, userId, cardId);
+    if (!task) {
+      throw new HttpError(404, 'NOT_FOUND', 'Card not found.');
+    }
+    const row = db.prepare('SELECT * FROM task_schedules WHERE task_id = ? AND user_id = ?').get(task.taskId, userId) as ScheduleRow | undefined;
+    if (!row) {
       throw new HttpError(404, 'NOT_FOUND', 'Card not found.');
     }
     const revision = asNumber(row.revision);
@@ -226,10 +252,10 @@ export function reviewCard(
     if (review.affectsSchedule) {
       const result = db
         .prepare(
-          `UPDATE schedules SET
+          `UPDATE task_schedules SET
             due = ?, stability = ?, difficulty = ?, elapsed_days = ?, scheduled_days = ?, learning_steps = ?,
             reps = ?, lapses = ?, state = ?, last_review = ?, revision = revision + 1, updated_at = ?
-          WHERE card_id = ? AND user_id = ? AND revision = ?`,
+          WHERE task_id = ? AND user_id = ? AND revision = ?`,
         )
         .run(
           after.due,
@@ -243,7 +269,7 @@ export function reviewCard(
           stateValue(after.state),
           after.lastReview,
           reviewedAt,
-          cardId,
+          task.taskId,
           userId,
           revision,
         );
@@ -254,7 +280,12 @@ export function reviewCard(
       }
       revisionAfter = revision + 1;
       updatedAt = reviewedAt;
-      raiseScheduleFloor(db, userId, cardId, revisionAfter);
+      raiseTaskHead(db, userId, task.taskId, revisionAfter);
+      const contexts = contextsForTask(db, userId, task.taskId);
+      const nextId = nextContextId(contexts, task.rotationOccurrenceId);
+      if (nextId !== task.rotationOccurrenceId) {
+        db.prepare('UPDATE task_rotation SET occurrence_id = ? WHERE task_id = ? AND user_id = ?').run(nextId, task.taskId, userId);
+      }
     }
     const eventId = randomUUID();
     db.prepare(
@@ -263,8 +294,8 @@ export function reviewCard(
         due_before, due_after, state_before, state_after, schedule_revision_before, schedule_revision_after,
         stability_before, stability_after, difficulty_before, difficulty_after,
         scheduled_days_before, scheduled_days_after, reps_after, lapses_after, elapsed_days_after, learning_steps_after,
-        created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        created_at, task_id, occurrence_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       eventId,
       userId,
@@ -290,6 +321,8 @@ export function reviewCard(
       after.elapsedDays,
       after.learningSteps,
       reviewedAt,
+      task.taskId,
+      owned.occurrence_id,
     );
     const progressRevision = bumpProgress(db, userId);
     const response = {
@@ -379,11 +412,12 @@ export function sameJson(left: unknown, right: unknown): boolean {
 }
 
 function requireItem(db: DatabaseSync, userId: string, cardId: string): ItemJson {
-  const row = db.prepare(`${ITEM_SQL} WHERE c.user_id = ? AND c.id = ?`).get(userId, cardId);
-  if (!row) {
+  const items = projectItems(db, userId, cardId);
+  const item = items[0];
+  if (!item) {
     throw new HttpError(404, 'NOT_FOUND', 'Card not found.');
   }
-  return toItem(row as Record<string, unknown>);
+  return item;
 }
 
 function requireEvent(db: DatabaseSync, userId: string, eventId: string): ReviewEventJson {
@@ -392,6 +426,30 @@ function requireEvent(db: DatabaseSync, userId: string, eventId: string): Review
     throw new HttpError(500, 'INTERNAL', 'Review event was not stored.');
   }
   return toEvent(row);
+}
+
+export function raiseTaskFloor(db: DatabaseSync, userId: string, taskId: string, revision: number): void {
+  db.prepare(
+    `INSERT INTO task_generation (user_id, task_id, high_water) VALUES (?, ?, ?)
+     ON CONFLICT(user_id, task_id) DO UPDATE SET high_water = max(high_water, excluded.high_water)`,
+  ).run(userId, taskId, revision);
+}
+
+export function taskFloor(db: DatabaseSync, userId: string, taskId: string): number {
+  const row = db.prepare('SELECT high_water FROM task_generation WHERE user_id = ? AND task_id = ?').get(userId, taskId) as
+    | { high_water: number | bigint }
+    | undefined;
+  return row ? asNumber(row.high_water) : 0;
+}
+
+export function raiseTaskHead(db: DatabaseSync, userId: string, taskId: string, revision: number): void {
+  raiseTaskFloor(db, userId, taskId, revision);
+  const members = db.prepare('SELECT card_id FROM task_members WHERE user_id = ? AND task_id = ?').all(userId, taskId) as Array<{
+    card_id: string;
+  }>;
+  for (const member of members) {
+    raiseScheduleFloor(db, userId, member.card_id, revision);
+  }
 }
 
 export function raiseScheduleFloor(db: DatabaseSync, userId: string, cardId: string, revision: number): void {
@@ -408,14 +466,56 @@ export function scheduleFloor(db: DatabaseSync, userId: string, cardId: string):
   return row ? asNumber(row.high_water) : 0;
 }
 
-function insertSchedule(db: DatabaseSync, userId: string, cardId: string, schedule: StoredSchedule, revision: number, updatedAt: string): void {
+function beginRecognition(
+  db: DatabaseSync,
+  userId: string,
+  senseId: string,
+  cardId: string,
+  occurrenceId: string,
+  instantDate: Date,
+  instant: string,
+): void {
+  const taskId = recognitionTaskId(senseId);
+  const schedule = emptySchedule(instantDate);
+  const revision = recognitionStartRevision(db, userId, taskId, cardId);
   db.prepare(
-    `INSERT INTO schedules (
-      card_id, user_id, due, stability, difficulty, elapsed_days, scheduled_days, learning_steps,
-      reps, lapses, state, last_review, revision, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO learning_tasks (id, user_id, sense_id, task_type, policy, donor_card_id, created_at)
+     VALUES (?, ?, ?, 'recognition', ?, ?, ?)`,
+  ).run(taskId, userId, senseId, TASK_POLICY, cardId, instant);
+  db.prepare('INSERT INTO task_members (user_id, task_id, card_id) VALUES (?, ?, ?)').run(userId, taskId, cardId);
+  insertTaskSchedule(db, userId, taskId, cardId, schedule, revision, instant);
+  db.prepare('INSERT INTO task_rotation (task_id, user_id, occurrence_id) VALUES (?, ?, ?)').run(taskId, userId, occurrenceId);
+  raiseScheduleFloor(db, userId, cardId, revision);
+  raiseTaskFloor(db, userId, taskId, revision);
+}
+
+function recognitionStartRevision(db: DatabaseSync, userId: string, taskId: string, cardId: string): number {
+  let floor = Math.max(taskFloor(db, userId, taskId), scheduleFloor(db, userId, cardId));
+  const aliases = db.prepare('SELECT card_id FROM alias_tombstones WHERE user_id = ? AND task_id = ?').all(userId, taskId) as Array<{
+    card_id: string;
+  }>;
+  for (const alias of aliases) {
+    floor = Math.max(floor, scheduleFloor(db, userId, alias.card_id));
+  }
+  return floor > 0 ? floor + 1 : 1;
+}
+
+function insertTaskSchedule(
+  db: DatabaseSync,
+  userId: string,
+  taskId: string,
+  donorCardId: string,
+  schedule: StoredSchedule,
+  revision: number,
+  updatedAt: string,
+): void {
+  db.prepare(
+    `INSERT INTO task_schedules (
+      task_id, user_id, due, stability, difficulty, elapsed_days, scheduled_days, learning_steps,
+      reps, lapses, state, last_review, revision, updated_at, donor_card_id, policy
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
-    cardId,
+    taskId,
     userId,
     schedule.due,
     schedule.stability,
@@ -429,7 +529,202 @@ function insertSchedule(db: DatabaseSync, userId: string, cardId: string, schedu
     schedule.lastReview,
     revision,
     updatedAt,
+    donorCardId,
+    TASK_POLICY,
   );
+}
+
+function taskForCard(
+  db: DatabaseSync,
+  userId: string,
+  cardId: string,
+): { taskId: string; rotationOccurrenceId: string } | undefined {
+  const row = db
+    .prepare(
+      `SELECT task_members.task_id AS task_id, task_rotation.occurrence_id AS occurrence_id
+       FROM task_members
+       JOIN task_rotation ON task_rotation.task_id = task_members.task_id AND task_rotation.user_id = task_members.user_id
+       WHERE task_members.user_id = ? AND task_members.card_id = ?`,
+    )
+    .get(userId, cardId) as { task_id: string; occurrence_id: string } | undefined;
+  return row ? { taskId: row.task_id, rotationOccurrenceId: row.occurrence_id } : undefined;
+}
+
+function contextsForTask(db: DatabaseSync, userId: string, taskId: string): Array<{ id: string; createdAt: string }> {
+  const rows = db
+    .prepare(
+      `SELECT source_occurrences.id AS id, source_occurrences.created_at AS created_at
+       FROM task_members
+       JOIN learner_cards ON learner_cards.id = task_members.card_id AND learner_cards.user_id = task_members.user_id
+       JOIN source_occurrences ON source_occurrences.id = learner_cards.occurrence_id AND source_occurrences.user_id = learner_cards.user_id
+       WHERE task_members.user_id = ? AND task_members.task_id = ?
+       ORDER BY source_occurrences.created_at ASC, source_occurrences.id ASC`,
+    )
+    .all(userId, taskId) as Array<{ id: string; created_at: string }>;
+  const seen = new Set<string>();
+  const contexts: Array<{ id: string; createdAt: string }> = [];
+  for (const row of rows) {
+    if (seen.has(row.id)) {
+      continue;
+    }
+    seen.add(row.id);
+    contexts.push({ id: row.id, createdAt: row.created_at });
+  }
+  return contexts;
+}
+
+const MEMBER_SQL = `
+SELECT
+  t.id AS task_id,
+  t.task_type AS task_type,
+  t.donor_card_id AS donor_card_id,
+  c.id AS card_id,
+  c.revision AS card_revision,
+  c.created_at AS card_created_at,
+  s.id AS sense_id,
+  s.lemma AS lemma,
+  s.part_of_speech AS part_of_speech,
+  s.meaning AS meaning,
+  s.created_at AS sense_created_at,
+  o.id AS occurrence_id,
+  o.sentence AS sentence,
+  o.sentence_translation AS sentence_translation,
+  o.eqbank_item_id AS eqbank_item_id,
+  o.eqbank_source AS eqbank_source,
+  o.eqbank_locator AS eqbank_locator,
+  o.created_at AS occurrence_created_at,
+  sch.due AS due,
+  sch.stability AS stability,
+  sch.difficulty AS difficulty,
+  sch.elapsed_days AS elapsed_days,
+  sch.scheduled_days AS scheduled_days,
+  sch.learning_steps AS learning_steps,
+  sch.reps AS reps,
+  sch.lapses AS lapses,
+  sch.state AS state,
+  sch.last_review AS last_review,
+  sch.revision AS schedule_revision,
+  sch.updated_at AS schedule_updated_at,
+  rot.occurrence_id AS rotation_occurrence_id
+FROM learning_tasks t
+JOIN task_schedules sch ON sch.task_id = t.id AND sch.user_id = t.user_id
+JOIN task_rotation rot ON rot.task_id = t.id AND rot.user_id = t.user_id
+JOIN task_members m ON m.task_id = t.id AND m.user_id = t.user_id
+JOIN learner_cards c ON c.id = m.card_id AND c.user_id = t.user_id
+JOIN word_senses s ON s.id = t.sense_id AND s.user_id = t.user_id
+JOIN source_occurrences o ON o.id = c.occurrence_id AND o.user_id = c.user_id
+`;
+
+function projectItems(db: DatabaseSync, userId: string, focusCardId: string | undefined): ItemJson[] {
+  const rows = db.prepare(`${MEMBER_SQL} WHERE t.user_id = ? ORDER BY t.created_at ASC, t.id ASC, o.created_at ASC, o.id ASC, c.id ASC`).all(userId) as MemberRow[];
+  const groups = new Map<string, MemberRow[]>();
+  for (const row of rows) {
+    const group = groups.get(row.task_id);
+    if (group) {
+      group.push(row);
+    } else {
+      groups.set(row.task_id, [row]);
+    }
+  }
+  const items: ItemJson[] = [];
+  for (const group of groups.values()) {
+    const head = group[0];
+    if (!head) {
+      continue;
+    }
+    if (focusCardId && !group.some((row) => row.card_id === focusCardId)) {
+      continue;
+    }
+    const contexts = contextsFrom(group);
+    const displayId = focusCardId ?? cardForOccurrence(group, head.rotation_occurrence_id);
+    const display = group.find((row) => row.card_id === displayId) ?? group.find((row) => row.occurrence_id === head.rotation_occurrence_id) ?? head;
+    items.push(toProjected(display, contexts));
+  }
+  return items;
+}
+
+function cardForOccurrence(rows: MemberRow[], occurrenceId: string): string {
+  const matches = rows.filter((row) => row.occurrence_id === occurrenceId).sort((left, right) => left.card_id.localeCompare(right.card_id));
+  return matches[0]?.card_id ?? rows[0]?.card_id ?? '';
+}
+
+function contextsFrom(rows: MemberRow[]): ContextJson[] {
+  const byOccurrence = new Map<string, { row: MemberRow; cardIds: string[] }>();
+  for (const row of rows) {
+    const current = byOccurrence.get(row.occurrence_id);
+    if (!current) {
+      byOccurrence.set(row.occurrence_id, { row, cardIds: [row.card_id] });
+      continue;
+    }
+    current.cardIds.push(row.card_id);
+    if (row.card_id < current.row.card_id) {
+      current.row = row;
+    }
+  }
+  return [...byOccurrence.values()]
+    .sort(
+      (left, right) =>
+        left.row.occurrence_created_at.localeCompare(right.row.occurrence_created_at) ||
+        left.row.occurrence_id.localeCompare(right.row.occurrence_id),
+    )
+    .map(({ row, cardIds }) => ({
+      id: row.occurrence_id,
+      senseId: row.sense_id,
+      sentence: row.sentence,
+      sentenceTranslation: row.sentence_translation,
+      eqbank: eqbankFrom(row.eqbank_item_id, row.eqbank_source, row.eqbank_locator),
+      createdAt: row.occurrence_created_at,
+      cardId: row.card_id,
+      cardIds: [...cardIds].sort(),
+    }));
+}
+
+function toProjected(row: MemberRow, contexts: ContextJson[]): ItemJson {
+  const schedule = toScheduleJson(row.card_id, storedFromMember(row), asNumber(row.schedule_revision), row.schedule_updated_at);
+  return {
+    card: {
+      id: row.card_id,
+      senseId: row.sense_id,
+      occurrenceId: row.occurrence_id,
+      createdAt: row.card_created_at,
+      revision: asNumber(row.card_revision),
+    },
+    sense: {
+      id: row.sense_id,
+      lemma: row.lemma,
+      partOfSpeech: row.part_of_speech,
+      meaning: row.meaning,
+      createdAt: row.sense_created_at,
+    },
+    occurrence: {
+      id: row.occurrence_id,
+      senseId: row.sense_id,
+      sentence: row.sentence,
+      sentenceTranslation: row.sentence_translation,
+      eqbank: eqbankFrom(row.eqbank_item_id, row.eqbank_source, row.eqbank_locator),
+      createdAt: row.occurrence_created_at,
+    },
+    schedule,
+    taskId: row.task_id,
+    taskType: row.task_type,
+    contextCount: contexts.length,
+    contexts,
+  };
+}
+
+function storedFromMember(row: MemberRow): StoredSchedule {
+  return {
+    due: row.due,
+    stability: asNumber(row.stability),
+    difficulty: asNumber(row.difficulty),
+    elapsedDays: asNumber(row.elapsed_days),
+    scheduledDays: asNumber(row.scheduled_days),
+    learningSteps: asNumber(row.learning_steps),
+    reps: asNumber(row.reps),
+    lapses: asNumber(row.lapses),
+    state: stateName(asNumber(row.state)),
+    lastReview: row.last_review,
+  };
 }
 
 function storedFromRow(row: ScheduleRow): StoredSchedule {
@@ -474,49 +769,6 @@ function toSense(row: { id: string; lemma: string; part_of_speech: string; meani
   };
 }
 
-function toItem(row: Record<string, unknown>): ItemJson {
-  const schedule: ScheduleJson = {
-    cardId: stringField(row, 'card_id'),
-    due: stringField(row, 'due'),
-    stability: numberField(row, 'stability'),
-    difficulty: numberField(row, 'difficulty'),
-    elapsedDays: numberField(row, 'elapsed_days'),
-    scheduledDays: numberField(row, 'scheduled_days'),
-    learningSteps: numberField(row, 'learning_steps'),
-    reps: numberField(row, 'reps'),
-    lapses: numberField(row, 'lapses'),
-    state: stateName(numberField(row, 'state')),
-    lastReview: nullableString(row, 'last_review'),
-    revision: numberField(row, 'schedule_revision'),
-    updatedAt: stringField(row, 'schedule_updated_at'),
-  };
-  return {
-    card: {
-      id: stringField(row, 'card_id'),
-      senseId: stringField(row, 'sense_id'),
-      occurrenceId: stringField(row, 'occurrence_id'),
-      createdAt: stringField(row, 'card_created_at'),
-      revision: numberField(row, 'card_revision'),
-    },
-    sense: {
-      id: stringField(row, 'sense_id'),
-      lemma: stringField(row, 'lemma'),
-      partOfSpeech: stringField(row, 'part_of_speech'),
-      meaning: stringField(row, 'meaning'),
-      createdAt: stringField(row, 'sense_created_at'),
-    },
-    occurrence: {
-      id: stringField(row, 'occurrence_id'),
-      senseId: stringField(row, 'sense_id'),
-      sentence: stringField(row, 'sentence'),
-      sentenceTranslation: nullableString(row, 'sentence_translation'),
-      eqbank: eqbankFrom(row.eqbank_item_id, row.eqbank_source, row.eqbank_locator),
-      createdAt: stringField(row, 'occurrence_created_at'),
-    },
-    schedule,
-  };
-}
-
 function toEvent(row: EventRow): ReviewEventJson {
   return {
     id: row.id,
@@ -542,6 +794,8 @@ function toEvent(row: EventRow): ReviewEventJson {
     elapsedDaysAfter: asNumber(row.elapsed_days_after),
     learningStepsAfter: asNumber(row.learning_steps_after),
     createdAt: row.created_at,
+    taskId: row.task_id,
+    occurrenceId: row.occurrence_id,
   };
 }
 
@@ -557,18 +811,6 @@ function eqbankFrom(itemId: unknown, source: unknown, locator: unknown): EqbankM
   return meta;
 }
 
-function stringField(row: Record<string, unknown>, key: string): string {
-  const value = row[key];
-  if (typeof value !== 'string') {
-    throw new HttpError(500, 'BAD_ROW', `Expected text in ${key}.`);
-  }
-  return value;
-}
-
-function numberField(row: Record<string, unknown>, key: string): number {
-  return asNumber(row[key]);
-}
-
 function asNumber(value: unknown): number {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value;
@@ -577,15 +819,4 @@ function asNumber(value: unknown): number {
     return Number(value);
   }
   throw new HttpError(500, 'BAD_ROW', 'Expected a number.');
-}
-
-function nullableString(row: Record<string, unknown>, key: string): string | null {
-  const value = row[key];
-  if (value === null || value === undefined) {
-    return null;
-  }
-  if (typeof value !== 'string') {
-    throw new HttpError(500, 'BAD_ROW', `Expected text in ${key}.`);
-  }
-  return value;
 }
