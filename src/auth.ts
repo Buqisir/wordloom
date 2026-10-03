@@ -91,6 +91,23 @@ export function logoutAccount(db: DatabaseSync, now: Date, sessionId: string): v
   db.prepare('UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL').run(now.toISOString(), sessionId);
 }
 
+export function lockedOwner(db: DatabaseSync, sessionId: string, expectedOwner: string | undefined, now: Date): string {
+  const expected = expectedOwner?.trim() ?? '';
+  if (!expected) {
+    throw new HttpError(400, 'VALIDATION', 'X-Wordloom-Owner is required.');
+  }
+  const row = db
+    .prepare('SELECT user_id, expires_at, revoked_at FROM sessions WHERE id = ?')
+    .get(sessionId) as { user_id: string; expires_at: string; revoked_at: string | null } | undefined;
+  if (!row || row.revoked_at !== null || row.expires_at <= now.toISOString()) {
+    throw new HttpError(401, 'UNAUTHENTICATED', 'Sign in is required.');
+  }
+  if (row.user_id !== expected) {
+    throw new HttpError(409, 'OWNER_MISMATCH', 'This write belongs to a different account.');
+  }
+  return row.user_id;
+}
+
 export function loadSession(db: DatabaseSync, token: string | undefined, now: Date): SessionRecord | undefined {
   if (!token) {
     return undefined;

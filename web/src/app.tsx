@@ -1,14 +1,20 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
-import { Cluster, Heading, Stack, WithSide } from 'lism-css/react';
+import { Cluster, Container, Heading, Stack, WithSide } from 'lism-css/react';
+import {
+  classifyWriteFailure,
+  SyncController,
+  SyncError,
+  type OutboxWrite,
+  type SyncAccount,
+  type SyncClassifier,
+  type SyncStorage,
+} from '../../src/clientSync.js';
 import {
   ApiError,
-  NetworkError,
-  clearPending,
   cookieValue,
   currentUser,
   explainError,
   loadBackup,
-  loadHistory,
   loadLibrary,
   loginAccount,
   logoutAccount,
@@ -18,12 +24,12 @@ import {
   setCsrf,
   writePending,
   type HistoryRow,
-  type PendingWrite,
   type SenseDetail,
 } from './api';
 import { previewBackup, type BackupPreview } from './backupPreview';
 import { gradeChoices, GRADE_LABEL } from './intervals';
-import type { BackupDocument, GradeName, ItemJson, UserJson } from '../../src/types.js';
+import { RevealedTranslation, reviewIntervalHint } from './reviewPrompt';
+import type { BackupDocument, GradeName, ItemJson, ReviewEventJson, UserJson } from '../../src/types.js';
 
 type Model = {
   user: UserJson | null;
@@ -32,7 +38,9 @@ type Model = {
   lastRead: string | null;
   readError: string | null;
   notice: string;
-  pending: PendingWrite[];
+  recovery: string;
+  pending: OutboxWrite[];
+  dismiss: (key: string) => void;
   items: ItemJson[];
   queue: ItemJson[];
   senses: SenseDetail[];
@@ -63,213 +71,149 @@ export function App() {
   );
 }
 
+const classifier: SyncClassifier = {
+  outcome(error: unknown) {
+    if (error instanceof ApiError) {
+      return classifyWriteFailure('http', error.status, error.code);
+    }
+    if (error instanceof SyncError) {
+      return classifyWriteFailure('http', error.status, error.code);
+    }
+    const name = error instanceof Error ? error.name : '';
+    if (name === 'ResponseReadError' || name === 'ResponsePayloadError') {
+      return classifyWriteFailure('body-read');
+    }
+    if (name === 'NetworkError') {
+      return classifyWriteFailure('network');
+    }
+    return classifyWriteFailure('network');
+  },
+  failure(error: unknown) {
+    if (error instanceof ApiError) {
+      return { code: error.code, message: explainError(error) };
+    }
+    if (error instanceof SyncError) {
+      return { code: error.code, message: error.message };
+    }
+    return { code: 'REQUEST_FAILED', message: error instanceof Error ? error.message : '写入没有成功。' };
+  },
+};
+
+function sessionStore(): SyncStorage {
+  return {
+    read(userId: string) {
+      return readPending(userId).map((item) => ({
+        ...item,
+        ownerId: item.ownerId && item.ownerId.length > 0 ? item.ownerId : userId,
+      }));
+    },
+    write: writePending,
+  };
+}
+
+function toHistory(items: ItemJson[], events: ReviewEventJson[]): HistoryRow[] {
+  const byCard = new Map(items.map((item) => [item.card.id, item]));
+  return events
+    .map((event) => {
+      const item = byCard.get(event.cardId);
+      return {
+        ...event,
+        lemma: item?.sense.lemma ?? '',
+        meaning: item?.sense.meaning ?? '',
+        sentence: item?.occurrence.sentence ?? '',
+        partOfSpeech: item?.sense.partOfSpeech ?? '',
+      };
+    })
+    .sort((left, right) => right.reviewedAt.localeCompare(left.reviewedAt) || right.id.localeCompare(left.id));
+}
+
+function accountOf(user: UserJson): SyncAccount {
+  return { id: user.id, email: user.email, progressRevision: user.progressRevision };
+}
+
 function useWordloom(): Model {
-  const [user, setUser] = useState<UserJson | null>(null);
-  const [booting, setBooting] = useState(true);
-  const [online, setOnline] = useState(navigator.onLine);
-  const [lastRead, setLastRead] = useState<string | null>(null);
-  const [readError, setReadError] = useState<string | null>(null);
-  const [notice, setNotice] = useState('');
-  const [pending, setPending] = useState<PendingWrite[]>([]);
-  const [items, setItems] = useState<ItemJson[]>([]);
-  const [queue, setQueue] = useState<ItemJson[]>([]);
-  const [senses, setSenses] = useState<SenseDetail[]>([]);
-  const [history, setHistory] = useState<HistoryRow[]>([]);
+  const [, setRevision] = useState(0);
   const [path, setPath] = useState(window.location.pathname);
-  const userRef = useRef(user);
-  const progressRef = useRef(0);
-  const flushing = useRef(false);
-  userRef.current = user;
-
-  async function reload(nextUser = userRef.current): Promise<void> {
-    if (!nextUser) {
-      return;
-    }
-    const library = await loadLibrary();
-    const events = await loadHistory(library.items);
-    setItems(library.items);
-    setQueue(library.queue);
-    setSenses(library.senses);
-    setHistory(events);
-    setLastRead(stamp());
-    setReadError(null);
-    progressRef.current = nextUser.progressRevision;
-  }
-
-  function remember(userId: string, entry: PendingWrite): void {
-    const current = readPending(userId);
-    const next = current.some((item) => item.key === entry.key) ? current : [...current, entry];
-    writePending(userId, next);
-    setPending(next);
-  }
-
-  function forget(userId: string, key: string): void {
-    const next = readPending(userId).filter((item) => item.key !== key);
-    writePending(userId, next);
-    setPending(next);
-  }
-
-  async function submitWrite(pathName: string, body: unknown, label: string): Promise<{ pending: boolean; replayed: boolean }> {
-    const current = userRef.current;
-    if (!current) {
-      throw new ApiError(401, 'UNAUTHENTICATED', '需要登录。');
-    }
-    const signature = JSON.stringify(body);
-    const existing = readPending(current.id).find((item) => item.path === pathName && JSON.stringify(item.body) === signature);
-    const entry = existing ?? { key: crypto.randomUUID(), path: pathName, body, label };
-    if (!navigator.onLine) {
-      remember(current.id, entry);
-      setOnline(false);
-      setNotice('还没送到服务器。');
-      return { pending: true, replayed: false };
-    }
-    try {
-      const result = await request(pathName, { method: 'POST', body, csrf: 'session', key: entry.key });
-      forget(current.id, entry.key);
-      const refreshed = await currentUser();
-      setUser(refreshed);
-      progressRef.current = refreshed.progressRevision;
-      await reload(refreshed);
-      setNotice(result.replayed ? '服务器返回了上次同一请求的结果，没有再次写入。' : '已保存到账户。');
-      return { pending: false, replayed: result.replayed };
-    } catch (error) {
-      if (error instanceof NetworkError) {
-        remember(current.id, entry);
-        setReadError(error.message);
-        setNotice('还没送到服务器。');
-        return { pending: true, replayed: false };
-      }
-      throw error;
-    }
-  }
-
-  async function flush(): Promise<void> {
-    const current = userRef.current;
-    if (!current || flushing.current || !navigator.onLine) {
-      return;
-    }
-    const queueItems = readPending(current.id);
-    if (queueItems.length === 0) {
-      return;
-    }
-    flushing.current = true;
-    const remain: PendingWrite[] = [];
-    let stop = false;
-    try {
-      for (const item of queueItems) {
-        if (stop) {
-          remain.push(item);
-          continue;
-        }
-        try {
-          const result = await request(item.path, { method: 'POST', body: item.body, csrf: 'session', key: item.key });
-          setNotice(result.replayed ? '服务器返回了上次同一请求的结果，没有再次写入。' : '已保存到账户。');
-        } catch (error) {
-          if (error instanceof NetworkError || (error instanceof ApiError && error.status >= 500)) {
-            remain.push(item);
-            stop = true;
-            setReadError(error instanceof NetworkError ? error.message : error.message);
-            continue;
-          }
-          if (error instanceof ApiError && error.status === 401) {
-            clearPending(current.id);
-            setPending([]);
-            setUser(null);
-            setNotice(explainError(error));
+  const controllerRef = useRef<SyncController<ItemJson, SenseDetail, ReviewEventJson> | null>(null);
+  if (!controllerRef.current) {
+    controllerRef.current = new SyncController(
+      {
+        currentUser: async () => accountOf(await currentUser()),
+        loadLibrary: async (expectedOwnerId) => loadLibrary(expectedOwnerId),
+        send: async (item) => {
+          const result = await request(item.path, {
+            method: 'POST',
+            body: item.body,
+            csrf: 'session',
+            key: item.key,
+            ownerId: item.ownerId,
+          });
+          return { replayed: result.replayed };
+        },
+      },
+      sessionStore(),
+      classifier,
+      () => crypto.randomUUID(),
+      {
+        online: navigator.onLine,
+        stamp,
+        onChange: () => setRevision((value) => value + 1),
+        lock: async (userId, run) => {
+          if (typeof navigator.locks?.request === 'function') {
+            await navigator.locks.request(`wordloom-flush-${userId}`, run);
             return;
           }
-          setNotice(error instanceof ApiError ? explainError(error) : '写入没有成功。');
-        }
-      }
-      writePending(current.id, remain);
-      setPending(remain);
-      if (remain.length !== queueItems.length) {
-        const refreshed = await currentUser();
-        setUser(refreshed);
-        await reload(refreshed);
-      }
-    } finally {
-      flushing.current = false;
-    }
+          await run();
+        },
+      },
+    );
   }
+  const controller = controllerRef.current;
+  const view = controller.snapshot();
+  const history = useMemo(() => toHistory(view.items, view.events), [view.items, view.events]);
 
   useEffect(() => {
-    let cancel = false;
+    const sync = controllerRef.current;
+    if (!sync) {
+      return;
+    }
+    let stop = false;
     void (async () => {
       if (cookieValue('wl_csrf')) {
         setCsrf(cookieValue('wl_csrf'));
       }
-      try {
-        const signedIn = await currentUser();
-        if (cancel) {
-          return;
-        }
-        setUser(signedIn);
-        progressRef.current = signedIn.progressRevision;
-        setPending(readPending(signedIn.id));
-        await reload(signedIn);
-      } catch (error) {
-        if (cancel) {
-          return;
-        }
-        if (error instanceof ApiError && error.status === 401) {
-          setUser(null);
-        } else {
-          setReadError(error instanceof Error ? error.message : '没能读取账户。');
-        }
-      } finally {
-        if (!cancel) {
-          setBooting(false);
-        }
+      if (stop) {
+        return;
       }
+      await sync.boot(() => currentUser().then(accountOf));
     })();
     return () => {
-      cancel = true;
+      stop = true;
+      sync.cancelBoot();
     };
   }, []);
 
   useEffect(() => {
+    const sync = controllerRef.current;
+    if (!sync) {
+      return;
+    }
     function onPop() {
       setPath(window.location.pathname);
     }
     function onOnline() {
-      setOnline(true);
-      void flush();
+      sync?.setOnline(true);
+      void sync?.flush();
     }
     function onOffline() {
-      setOnline(false);
+      sync?.setOnline(false);
     }
     window.addEventListener('popstate', onPop);
     window.addEventListener('online', onOnline);
     window.addEventListener('offline', onOffline);
     const timer = window.setInterval(() => {
-      setOnline(navigator.onLine);
-      if (!navigator.onLine || !userRef.current) {
-        return;
-      }
-      void (async () => {
-        if (readPending(userRef.current?.id ?? '').length > 0) {
-          await flush();
-          return;
-        }
-        try {
-          const next = await currentUser();
-          setLastRead(stamp());
-          setReadError(null);
-          setUser(next);
-          if (next.progressRevision !== progressRef.current) {
-            progressRef.current = next.progressRevision;
-            await reload(next);
-            setNotice('进度版本已更新。');
-          }
-        } catch (error) {
-          if (error instanceof NetworkError) {
-            setReadError(error.message);
-          } else if (error instanceof ApiError && error.status === 401) {
-            setUser(null);
-          }
-        }
-      })();
+      sync.setOnline(navigator.onLine);
+      void sync.poll(Date.now());
     }, 1500);
     return () => {
       window.removeEventListener('popstate', onPop);
@@ -284,66 +228,62 @@ function useWordloom(): Model {
     setPath(next);
   }
 
+  async function enter(account: UserJson): Promise<void> {
+    controller.adopt(accountOf(account));
+    await controller.reload();
+    const queued = controller.snapshot().pending.filter((item) => !item.failure).length;
+    if (queued > 0) {
+      controller.setNotice(`还有 ${queued} 次写入没送到服务器，会用原来的请求继续发送。`);
+      await controller.flush();
+    }
+  }
+
   const model: Model = {
-    user,
-    booting,
-    online,
-    lastRead,
-    readError,
-    notice,
-    pending,
-    items,
-    queue,
-    senses,
+    user: view.user,
+    booting: view.booting,
+    online: view.online,
+    lastRead: view.lastRead,
+    readError: view.readError,
+    notice: view.notice,
+    recovery: view.recovery,
+    pending: view.pending,
+    items: view.items,
+    queue: view.queue,
+    senses: view.senses,
     history,
     path,
     go,
+    dismiss(key) {
+      controller.dismiss(key);
+    },
     async register(email, password) {
-      const signedIn = await registerAccount(email, password);
-      setUser(signedIn);
-      progressRef.current = signedIn.progressRevision;
-      setPending(readPending(signedIn.id));
-      await reload(signedIn);
+      await enter(await registerAccount(email, password));
       go('/review');
     },
     async login(email, password) {
-      const signedIn = await loginAccount(email, password);
-      setUser(signedIn);
-      progressRef.current = signedIn.progressRevision;
-      setPending(readPending(signedIn.id));
-      await reload(signedIn);
+      await enter(await loginAccount(email, password));
       go('/review');
     },
     async logout() {
-      const current = userRef.current;
+      const current = controller.snapshot().user?.id ?? null;
       await logoutAccount();
-      if (current) {
-        clearPending(current.id);
-      }
-      setPending([]);
-      setUser(null);
-      setItems([]);
-      setQueue([]);
-      setSenses([]);
-      setHistory([]);
-      setNotice('');
+      controller.logoutLocal(current);
       go('/');
     },
     async createCard(body) {
-      await submitWrite('/api/cards', body, '添加卡片');
+      await controller.submit('/api/cards', body, '添加卡片');
     },
     async review(cardId, grade, revision) {
-      const current = userRef.current;
       const pathName = `/api/cards/${cardId}/reviews`;
-      if (current && readPending(current.id).some((item) => item.path === pathName)) {
-        setNotice('这张卡片有一次评分还没送到服务器。');
+      if (controller.blocksPath(pathName)) {
+        controller.setNotice('这张卡片有一次评分还没送到服务器。');
         return 'pending';
       }
-      const result = await submitWrite(pathName, { grade, affectsSchedule: true, expectedScheduleRevision: revision }, '复习评分');
+      const result = await controller.submit(pathName, { grade, affectsSchedule: true, expectedScheduleRevision: revision }, '复习评分');
       return result.pending ? 'pending' : 'saved';
     },
     async restore(mode, document) {
-      await submitWrite('/api/backup/restore', mode === 'replace' ? { mode, confirm: 'replace', document } : { mode, document }, '导入备份');
+      await controller.submit('/api/backup/restore', mode === 'replace' ? { mode, confirm: 'replace', document } : { mode, document }, '导入备份');
     },
     async downloadBackup() {
       const document = await loadBackup();
@@ -355,7 +295,7 @@ function useWordloom(): Model {
       link.click();
       link.remove();
       URL.revokeObjectURL(url);
-      setLastRead(stamp());
+      controller.noteRead();
     },
     accountBackup: loadBackup,
   };
@@ -374,37 +314,39 @@ function Shell() {
   const model = useApp();
   const page = pageFor(model.path);
   return (
-    <WithSide className="shell" sideW="220px" g="0">
-      <Stack isSide className="side-nav" g="10">
-        <p className="brand">Wordloom</p>
-        <nav aria-label="主导航">
-          <Stack g="5">
-            <NavLinks />
-          </Stack>
-        </nav>
-        <p className="account-email">{model.user?.email}</p>
-        <button type="button" className="button" onClick={() => void model.logout()}>
-          退出
-        </button>
-      </Stack>
-      <div className="main-column">
-        <Stack g="15">
-          <div className="account-top">
-            <Cluster g="10" ai="center">
-              <p className="account-email">{model.user?.email}</p>
-              <button type="button" className="button" onClick={() => void model.logout()}>
-                退出
-              </button>
-            </Cluster>
-          </div>
-          <StatusBar />
-          <main id="main">{page}</main>
+    <Container>
+      <WithSide className="shell" sideW="220px" g="0" isContainer>
+        <Stack isSide className="side-nav" g="10">
+          <p className="brand">Wordloom</p>
+          <nav aria-label="主导航">
+            <Stack g="5">
+              <NavLinks />
+            </Stack>
+          </nav>
+          <p className="account-email">{model.user?.email}</p>
+          <button type="button" className="button" onClick={() => void model.logout()}>
+            退出
+          </button>
         </Stack>
-      </div>
-      <nav className="bottom-nav" aria-label="主导航">
-        <NavLinks />
-      </nav>
-    </WithSide>
+        <div className="main-column">
+          <Stack g="30">
+            <div className="account-top">
+              <Cluster g="10" ai="center">
+                <p className="account-email">{model.user?.email}</p>
+                <button type="button" className="button" onClick={() => void model.logout()}>
+                  退出
+                </button>
+              </Cluster>
+            </div>
+            <StatusBar />
+            <main id="main">{page}</main>
+          </Stack>
+        </div>
+        <nav className="bottom-nav" aria-label="主导航">
+          <NavLinks />
+        </nav>
+      </WithSide>
+    </Container>
   );
 }
 
@@ -460,6 +402,8 @@ function pageFor(path: string): ReactNode {
 
 function StatusBar() {
   const model = useApp();
+  const waiting = model.pending.filter((item) => !item.failure);
+  const rejected = model.pending.filter((item) => item.failure);
   const parts = [model.online ? '在线' : '离线'];
   if (model.lastRead) {
     parts.push(`上次成功读取账户 ${model.lastRead}`);
@@ -470,16 +414,28 @@ function StatusBar() {
   if (model.readError) {
     parts.push(`连接失败：${model.readError}。画面可能不是最新。`);
   }
-  if (model.pending.length > 0) {
-    parts.push(`有 ${model.pending.length} 次写入还没送到服务器，会用原来的请求重试。`);
+  if (waiting.length > 0) {
+    parts.push(`有 ${waiting.length} 次写入还没送到服务器，会用原来的请求重试。`);
   }
   if (model.notice) {
     parts.push(model.notice);
   }
   return (
-    <p className="status" role="status">
-      {parts.join('。')}
-    </p>
+    <Stack g="10">
+      <p className="status" role="status">
+        {parts.join('。')}
+      </p>
+      {rejected.map((item) => (
+        <Cluster key={item.key} g="10" ai="center">
+          <p className="error" role="alert">
+            {item.label}没有写入。{item.failure?.message}
+          </p>
+          <button type="button" className="button" onClick={() => model.dismiss(item.key)}>
+            不再保留
+          </button>
+        </Cluster>
+      ))}
+    </Stack>
   );
 }
 
@@ -488,9 +444,25 @@ function Auth() {
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const emailRef = useRef<HTMLInputElement>(null);
+  const passwordRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!error) {
+      return;
+    }
+    if (!emailRef.current?.value) {
+      emailRef.current?.focus();
+      return;
+    }
+    passwordRef.current?.focus();
+  }, [error]);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (busy) {
+      return;
+    }
     const data = new FormData(event.currentTarget);
     const email = String(data.get('email') ?? '');
     const password = String(data.get('password') ?? '');
@@ -509,50 +481,93 @@ function Auth() {
     }
   }
 
+  const passwordHint = mode === 'login' ? '登录使用这个账户已经设置的密码。' : '注册密码需要 10 到 200 个字符，请用你能记住的一串字符。';
+  const support = mode === 'login' ? '登录后，手机和电脑共用这一账户里的词和原句。' : '注册后，词和原句记在这个账户里，手机和电脑都能打开。';
+
   return (
-    <main id="main" className="main-column">
-      <Stack g="15">
-        <Heading level="1" className="page-title">
-          {mode === 'login' ? '登录' : '注册'}
-        </Heading>
-        <p className="hint">目前只支持邮箱和密码。</p>
-        <form onSubmit={(event) => void onSubmit(event)}>
-          <Stack g="12">
-            <div className="field">
-              <label htmlFor="email">邮箱</label>
-              <input id="email" name="email" type="email" autoComplete="username" required maxLength={320} />
-            </div>
-            <div className="field">
-              <label htmlFor="password">密码</label>
-              <input
-                id="password"
-                name="password"
-                type="password"
-                autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-                required
-                minLength={10}
-                maxLength={200}
-                aria-describedby="password-hint"
-              />
-            </div>
-            <p id="password-hint" className="hint">
-              10 到 200 个字符。
-            </p>
-            {error ? (
-              <p className="error" role="alert">
-                {error}
-              </p>
-            ) : null}
-            <button type="submit" className="button button-primary" disabled={busy}>
-              {mode === 'login' ? '登录' : '注册'}
-            </button>
+    <Container>
+      <main id="main" className="auth-screen">
+        <WithSide className="auth-split" sideW="390px" mainW="460px" g="30" isContainer>
+          <Stack isSide className="auth-form" g="20">
+              <p className="brand">Wordloom</p>
+              <Heading level="1" className="auth-title">
+                {mode === 'login' ? '登录' : '注册'}
+              </Heading>
+              <p className="hint">{support}</p>
+              {model.recovery ? (
+                <p className="status" role="status">
+                  {model.recovery}
+                </p>
+              ) : null}
+              <form onSubmit={(event) => void onSubmit(event)}>
+                <div className="auth-fields">
+                  <div className="field">
+                    <label htmlFor="email">邮箱</label>
+                    <input
+                      ref={emailRef}
+                      id="email"
+                      name="email"
+                      type="email"
+                      autoComplete="email"
+                      required
+                      maxLength={320}
+                      aria-invalid={error ? true : undefined}
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="password">密码</label>
+                    <input
+                      ref={passwordRef}
+                      id="password"
+                      name="password"
+                      type="password"
+                      autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+                      required
+                      minLength={10}
+                      maxLength={200}
+                      aria-describedby={error ? 'password-hint auth-error' : 'password-hint'}
+                      aria-invalid={error ? true : undefined}
+                    />
+                    <p id="password-hint" className="hint">
+                      {passwordHint}
+                    </p>
+                  </div>
+                  {error ? (
+                    <p id="auth-error" className="error" role="alert">
+                      {error}
+                    </p>
+                  ) : null}
+                  <button type="submit" className="button button-primary auth-submit" disabled={busy} aria-busy={busy}>
+                    {busy ? (mode === 'login' ? '正在登录' : '正在注册') : mode === 'login' ? '登录' : '注册'}
+                  </button>
+                </div>
+              </form>
+              <button
+                type="button"
+                className="button auth-switch"
+                onClick={() => {
+                  setMode(mode === 'login' ? 'register' : 'login');
+                  setError('');
+                }}
+                disabled={busy}
+              >
+                {mode === 'login' ? '注册新账户' : '改用登录'}
+              </button>
           </Stack>
-        </form>
-        <button type="button" className="button" onClick={() => setMode(mode === 'login' ? 'register' : 'login')}>
-          {mode === 'login' ? '注册新账户' : '改用登录'}
-        </button>
-      </Stack>
-    </main>
+          <aside className="auth-preview" aria-label="词在原句里的样子">
+            <Stack g="20">
+              <p className="eyebrow">语境中的词</p>
+              <p className="headword">harbor</p>
+              <p className="meta">noun</p>
+              <p className="meaning">可以停靠的港湾</p>
+              <p className="sentence">
+                The <mark className="target-word">harbor</mark> light marked a quiet channel.
+              </p>
+            </Stack>
+          </aside>
+        </WithSide>
+      </main>
+    </Container>
   );
 }
 
@@ -598,12 +613,12 @@ function AddPage() {
   }
 
   return (
-    <Stack g="15">
+    <Stack className="reading-column" g="30">
       <Heading level="1" className="page-title">
         添加
       </Heading>
       <form onSubmit={(event) => void onSubmit(event)}>
-        <Stack g="12">
+        <Stack g="30">
           <div className="field">
             <label htmlFor="sense-id">记到已有义项</label>
             <select id="sense-id" value={senseId} onChange={(event) => setSenseId(event.target.value)}>
@@ -688,7 +703,7 @@ function ReviewPage() {
 
   if (!card) {
     return (
-      <Stack g="10">
+      <Stack className="review-column" g="30">
         <Heading level="1" className="page-title">
           复习
         </Heading>
@@ -713,12 +728,13 @@ function ReviewPage() {
   }
 
   return (
-    <Stack g="15">
+    <Stack className="review-column" g="30">
       <Heading level="1" className="page-title">
         复习
       </Heading>
-      <article className="card">
-        <Stack g="12">
+      <p className="meta">到期 {model.queue.length} 张。当前这一张在最上面。</p>
+      <article className="card review-card">
+        <Stack g="20">
           <h2 className="headword">{card.sense.lemma}</h2>
           <p className="meta">{card.sense.partOfSpeech}</p>
           <Sentence sentence={card.occurrence.sentence} lemma={card.sense.lemma} />
@@ -730,13 +746,13 @@ function ReviewPage() {
               显示释义
             </button>
           )}
-          {card.occurrence.sentenceTranslation ? <p className="meta">译文：{card.occurrence.sentenceTranslation}</p> : null}
+          <RevealedTranslation revealed={revealed} sentenceTranslation={card.occurrence.sentenceTranslation} />
         </Stack>
       </article>
       {revealed ? (
         <Stack g="10">
-          <p className="hint">间隔用与服务器相同的 FSRS 5.4.2 计算，模糊已关闭。点下去以后，以服务器保存的到期时间为准。</p>
-          <Cluster g="10">
+          <p className="hint">{reviewIntervalHint}</p>
+          <Cluster className="grade-strip" g="10">
             {choices.map((choice) => (
               <button
                 key={choice.grade}
@@ -821,7 +837,7 @@ function LibraryPage() {
   }
 
   return (
-    <Stack g="15">
+    <Stack g="30">
       <Heading level="1" className="page-title">
         词库
       </Heading>
@@ -910,15 +926,15 @@ function LibraryPage() {
 function HistoryPage() {
   const { history } = useApp();
   return (
-    <Stack g="15">
+    <Stack g="30">
       <Heading level="1" className="page-title">
         历史
       </Heading>
       {history.length === 0 ? <p>还没有复习记录。</p> : null}
       {history.map((event) => (
-        <article key={event.id} className="card">
-          <Stack g="8">
-            <h2 className="headword">{event.lemma}</h2>
+        <article key={event.id} className="card card-row">
+          <Stack g="10">
+            <h2 className="list-headword">{event.lemma}</h2>
             <p className="meta">{event.partOfSpeech}</p>
             <Sentence sentence={event.sentence} lemma={event.lemma} />
             <p className="meaning">义项：{event.meaning}</p>
@@ -938,15 +954,17 @@ function HistoryPage() {
 
 function LinkedCard({ item }: { item: ItemJson }) {
   return (
-    <article className="card">
-      <Stack g="8">
-        <h2 className="headword">{item.sense.lemma}</h2>
-        <p className="meta">{item.sense.partOfSpeech}</p>
+    <article className="card card-row">
+      <Stack g="10">
+        <div className="library-line">
+          <div>
+            <h2 className="list-headword">{item.sense.lemma}</h2>
+            <p className="meta">{item.sense.partOfSpeech}</p>
+          </div>
+          <p className="meaning">义项：{item.sense.meaning}</p>
+          <p className="meta">到期 {formatWhen(item.schedule.due)}</p>
+        </div>
         <Sentence sentence={item.occurrence.sentence} lemma={item.sense.lemma} />
-        <p className="meaning">义项：{item.sense.meaning}</p>
-        <p className="meta">
-          到期 {item.schedule.due} · 日程版本 {item.schedule.revision}
-        </p>
       </Stack>
     </article>
   );
@@ -1064,6 +1082,14 @@ function splitHighlight(sentence: string, lemma: string): Array<{ text: string; 
     parts.push({ text: sentence.slice(last), hit: false });
   }
   return parts.length > 0 ? parts : [{ text: sentence, hit: false }];
+}
+
+function formatWhen(value: string): string {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) {
+    return value;
+  }
+  return new Date(parsed).toLocaleString('zh-CN', { hour12: false });
 }
 
 function stamp(): string {

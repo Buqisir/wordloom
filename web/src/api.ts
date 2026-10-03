@@ -1,3 +1,4 @@
+import { readResponseText, ResponsePayloadError, stampOwner } from '../../src/clientSync.js';
 import type { BackupDocument, ItemJson, OccurrenceJson, ReviewEventJson, SenseJson, UserJson } from '../../src/types.js';
 
 export type SenseDetail = SenseJson & { occurrences: OccurrenceJson[] };
@@ -14,6 +15,8 @@ export type PendingWrite = {
   path: string;
   body: unknown;
   label: string;
+  ownerId?: string;
+  failure?: { code: string; message: string };
 };
 
 export class ApiError extends Error {
@@ -34,6 +37,13 @@ export class NetworkError extends Error {
   constructor() {
     super('没有连上服务器。');
     this.name = 'NetworkError';
+  }
+}
+
+export class ResponseReadError extends NetworkError {
+  constructor() {
+    super();
+    this.name = 'ResponseReadError';
   }
 }
 
@@ -77,6 +87,7 @@ export function explainError(error: ApiError): string {
     IDEMPOTENCY_CONFLICT: '同一次请求编号已经用于不同的内容。',
     SCHEMA_UNSUPPORTED: '备份的 schemaVersion 不受支持。',
     CONFLICT: '备份里有属于另一个账户的记录。',
+    OWNER_MISMATCH: '这次写入属于另一个账户，已保留。',
     SNAPSHOT_CONFLICT: '备份和账户里的同一条记录内容不同。',
     VALIDATION: '提交的内容没有通过校验。',
     UNAUTHENTICATED: '需要登录。',
@@ -86,7 +97,7 @@ export function explainError(error: ApiError): string {
   return error.message && error.message !== lead ? `${lead} ${error.message}（${error.code}）` : `${lead}（${error.code}）`;
 }
 
-export async function request<T>(path: string, init?: { method?: string; body?: unknown; csrf?: 'setup' | 'session'; key?: string }): Promise<{ status: number; body: T; replayed: boolean }> {
+export async function request<T>(path: string, init?: { method?: string; body?: unknown; csrf?: 'setup' | 'session'; key?: string; ownerId?: string }): Promise<{ status: number; body: T; replayed: boolean }> {
   const headers: Record<string, string> = {};
   if (init?.body !== undefined) {
     headers['content-type'] = 'application/json';
@@ -100,6 +111,9 @@ export async function request<T>(path: string, init?: { method?: string; body?: 
   if (init?.key) {
     headers['idempotency-key'] = init.key;
   }
+  if (init?.ownerId) {
+    headers['x-wordloom-owner'] = init.ownerId;
+  }
   let response: Response;
   try {
     response = await fetch(path, {
@@ -111,7 +125,15 @@ export async function request<T>(path: string, init?: { method?: string; body?: 
   } catch {
     throw new NetworkError();
   }
-  const text = await response.text();
+  let text: string;
+  try {
+    text = await readResponseText(response);
+  } catch (error) {
+    if (error instanceof ResponsePayloadError) {
+      throw new ResponseReadError();
+    }
+    throw error;
+  }
   let parsed: unknown = null;
   if (text) {
     try {
@@ -168,29 +190,21 @@ export async function currentUser(): Promise<UserJson> {
   return result.body.user;
 }
 
-export async function loadLibrary(): Promise<{ items: ItemJson[]; queue: ItemJson[]; senses: SenseDetail[] }> {
-  const [items, queue, senses] = await Promise.all([
-    request<{ items: ItemJson[] }>('/api/cards'),
-    request<{ items: ItemJson[] }>('/api/queue'),
-    request<{ senses: SenseDetail[] }>('/api/senses'),
-  ]);
-  return { items: items.body.items, queue: queue.body.items, senses: senses.body.senses };
-}
-
-export async function loadHistory(items: ItemJson[]): Promise<HistoryRow[]> {
-  const groups = await Promise.all(
-    items.map(async (item) => {
-      const result = await request<{ events: ReviewEventJson[] }>(`/api/cards/${item.card.id}/events`);
-      return result.body.events.map((event) => ({
-        ...event,
-        lemma: item.sense.lemma,
-        meaning: item.sense.meaning,
-        sentence: item.occurrence.sentence,
-        partOfSpeech: item.sense.partOfSpeech,
-      }));
-    }),
-  );
-  return groups.flat().sort((left, right) => right.reviewedAt.localeCompare(left.reviewedAt) || right.id.localeCompare(left.id));
+export async function loadLibrary(ownerId: string): Promise<{
+  user: UserJson;
+  items: ItemJson[];
+  queue: ItemJson[];
+  senses: SenseDetail[];
+  events: ReviewEventJson[];
+}> {
+  const result = await request<{
+    user: UserJson;
+    items: ItemJson[];
+    queue: ItemJson[];
+    senses: SenseDetail[];
+    events: ReviewEventJson[];
+  }>('/api/library', { ownerId });
+  return result.body;
 }
 
 export async function loadBackup(): Promise<BackupDocument> {
@@ -212,7 +226,7 @@ export function readPending(userId: string): PendingWrite[] {
     if (!Array.isArray(parsed)) {
       return [];
     }
-    return parsed.filter(isPending);
+    return parsed.filter(isPending).map((item) => stampOwner(userId, item));
   } catch {
     return [];
   }
@@ -231,5 +245,18 @@ function isPending(value: unknown): value is PendingWrite {
     return false;
   }
   const record = value as Record<string, unknown>;
-  return typeof record.key === 'string' && typeof record.path === 'string' && typeof record.label === 'string' && 'body' in record;
+  if (typeof record.key !== 'string' || typeof record.path !== 'string' || typeof record.label !== 'string' || !('body' in record)) {
+    return false;
+  }
+  if (record.ownerId !== undefined && typeof record.ownerId !== 'string') {
+    return false;
+  }
+  if (record.failure === undefined) {
+    return true;
+  }
+  if (typeof record.failure !== 'object' || record.failure === null) {
+    return false;
+  }
+  const failure = record.failure as Record<string, unknown>;
+  return typeof failure.code === 'string' && typeof failure.message === 'string';
 }

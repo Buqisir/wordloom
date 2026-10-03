@@ -1,7 +1,7 @@
 body {
   margin: 0;
-  background: #fff;
-  color: #1a1a1a;
+  background: #fcfcfc;
+  color: #20242b;
   font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
   font-size: 16px;
   line-height: 1.5;
@@ -20,10 +20,76 @@ summary {
   align-items: stretch;
 }
 
+.auth-screen {
+  box-sizing: border-box;
+  width: min(960px, 100%);
+  min-height: 100dvh;
+  margin-inline: auto;
+  padding: 56px 24px 40px;
+}
+
+.auth-split {
+  align-items: stretch;
+  width: 100%;
+}
+
+.auth-form {
+  width: min(390px, 100%);
+}
+
+.auth-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.auth-title {
+  margin: 0;
+  color: #20242b;
+  font-size: 30px;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.auth-preview {
+  box-sizing: border-box;
+  padding: 28px 24px;
+  border: 1px solid #e5e7eb;
+  border-radius: 16px;
+  background: #f4f6f8;
+  animation: reveal 180ms ease;
+}
+
+.eyebrow {
+  margin: 0;
+  color: #5f6875;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.auth-submit {
+  width: 100%;
+  min-height: 48px;
+  border-radius: 999px;
+}
+
+.auth-switch {
+  align-self: flex-start;
+  background: transparent;
+  color: #5f6875;
+}
+
+.auth-form .field input {
+  min-height: 48px;
+  border-radius: 12px;
+  font-size: 16px;
+}
+
 .side-nav {
   min-height: 100dvh;
   padding: 16px;
-  border-right: 1px solid #d7d7d7;
+  border-right: 1px solid #e5e7eb;
   background: #fff;
 }
 
@@ -47,8 +113,9 @@ summary {
   padding: 8px 10px;
   border: 1px solid transparent;
   border-radius: 10px;
-  color: #1a1a1a;
+  color: #20242b;
   text-decoration: none;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
 .nav-link[aria-current="page"] {
@@ -57,31 +124,47 @@ summary {
 }
 
 .main-column {
+  box-sizing: border-box;
+  width: min(1040px, 100%);
   min-width: 0;
-  padding: 20px 20px 32px;
+  margin-inline: auto;
+  padding: 24px 16px 32px;
+}
+
+.reading-column,
+.review-column {
+  width: min(720px, 100%);
 }
 
 .page-title {
   margin: 0;
-  color: #1a1a1a;
+  color: #20242b;
   font-family: inherit;
   font-size: 22px;
   font-weight: 600;
   line-height: 1.3;
 }
 
-.headword {
+.headword,
+.list-headword {
   margin: 0;
-  color: #1a1a1a;
+  color: #20242b;
   font-family: Georgia, "Times New Roman", serif;
-  font-size: 38px;
   font-weight: 400;
   line-height: 1.2;
 }
 
+.headword {
+  font-size: 38px;
+}
+
+.list-headword {
+  font-size: 28px;
+}
+
 .sentence {
   margin: 0;
-  color: #1a1a1a;
+  color: #20242b;
   font-size: 18px;
   line-height: 1.5;
 }
@@ -97,19 +180,26 @@ mark.target-word {
 .status,
 .account-email {
   margin: 0;
-  color: #1a1a1a;
+  color: #20242b;
 }
 
 .hint,
 .meta,
-.account-email {
-  color: #3a3a3a;
+.account-email,
+.eyebrow {
+  color: #5f6875;
+}
+
+.review-card .meaning {
+  border-top: 1px solid #e5e7eb;
+  padding-top: 16px;
+  color: #20242b;
 }
 
 .field {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .field input,
@@ -117,10 +207,10 @@ mark.target-word {
 .field textarea {
   min-height: 44px;
   padding: 8px 10px;
-  border: 1px solid #cfcfcf;
-  border-radius: 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
   background: #fff;
-  color: #1a1a1a;
+  color: #20242b;
 }
 
 .field textarea {
@@ -130,15 +220,17 @@ mark.target-word {
 
 .button {
   padding: 8px 12px;
-  border: 1px solid #cfcfcf;
+  border: 1px solid #e5e7eb;
   border-radius: 10px;
   background: #fff;
-  color: #1a1a1a;
+  color: #20242b;
   cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
 .button-primary {
   border-color: #2464b5;
+  border-radius: 999px;
   background: #2464b5;
   color: #fff;
 }
@@ -150,9 +242,35 @@ mark.target-word {
 
 .card {
   padding: 16px;
-  border: 1px solid #d7d7d7;
-  border-radius: 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 16px;
   background: #fff;
+  box-shadow: 0 1px 2px rgba(32, 36, 43, 0.06);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.review-card {
+  padding: 28px 24px;
+  animation: reveal 180ms ease;
+}
+
+.library-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.card-row {
+  padding: 14px 16px;
 }
 
 .summary {
@@ -168,8 +286,8 @@ mark.target-word {
 
 .status {
   padding: 10px 12px;
-  border: 1px solid #d7d7d7;
-  border-radius: 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
 }
 
 .skip {
@@ -196,14 +314,14 @@ mark.target-word {
 dialog {
   width: min(32rem, calc(100vw - 32px));
   padding: 16px;
-  border: 1px solid #d7d7d7;
-  border-radius: 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 16px;
   background: #fff;
-  color: #1a1a1a;
+  color: #20242b;
 }
 
 dialog::backdrop {
-  background: rgba(26, 26, 26, 0.4);
+  background: rgba(32, 36, 43, 0.4);
 }
 
 .check {
@@ -216,6 +334,17 @@ dialog::backdrop {
 :focus-visible {
   outline: 2px solid #2464b5;
   outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .button,
+  .nav-link,
+  .card,
+  .auth-preview,
+  .review-card {
+    transition: none;
+    animation: none;
+  }
 }
 
 @media (max-width: 759px) {
@@ -231,18 +360,66 @@ dialog::backdrop {
     padding: 16px 16px 88px;
   }
 
+  .headword {
+    font-size: 32px;
+  }
+
+  .grade-strip {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .grade-strip .button {
+    width: 100%;
+  }
+
+  .auth-screen {
+    width: 100%;
+    padding: 24px 20px 32px;
+  }
+
+  .auth-preview {
+    display: none;
+  }
+
+  .auth-form {
+    width: 100%;
+  }
+
   .bottom-nav {
     position: fixed;
     right: 0;
     bottom: 0;
     left: 0;
     display: flex;
-    border-top: 1px solid #d7d7d7;
+    border-top: 1px solid #e5e7eb;
     background: #fff;
   }
 
   .bottom-nav .nav-link {
     flex: 1;
     justify-content: center;
+  }
+}
+
+@media (min-width: 760px) {
+  .library-line {
+    grid-template-columns: 180px minmax(0, 1fr) auto;
+    align-items: start;
+    column-gap: 16px;
+  }
+}
+
+@media (max-width: 879px) {
+  .auth-preview {
+    display: none;
+  }
+
+  .auth-screen {
+    width: 100%;
+  }
+
+  .auth-form {
+    width: 100%;
   }
 }

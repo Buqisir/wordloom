@@ -11,6 +11,7 @@ export type Jar = {
   cookies: Map<string, string>;
   setup: string;
   csrf: string;
+  userId?: string;
 };
 
 export type ApiResponse = {
@@ -75,7 +76,7 @@ export async function api(
   method: string,
   path: string,
   body?: unknown,
-  options?: { csrf?: 'setup' | 'session'; idempotencyKey?: string; origin?: string | null; referer?: string },
+  options?: { csrf?: 'setup' | 'session'; idempotencyKey?: string; origin?: string | null; referer?: string; ownerId?: string | null },
 ): Promise<ApiResponse> {
   const headers: Record<string, string> = {};
   const cookie = [...jar.cookies.entries()].map(([name, value]) => `${name}=${value}`).join('; ');
@@ -91,6 +92,12 @@ export async function api(
   if (options?.idempotencyKey) {
     headers['idempotency-key'] = options.idempotencyKey;
   }
+  if (options?.ownerId !== null) {
+    const owner = typeof options?.ownerId === 'string' ? options.ownerId : jar.userId;
+    if (owner) {
+      headers['x-wordloom-owner'] = owner;
+    }
+  }
   if (options?.origin !== null) {
     headers.origin = options?.origin ?? new URL(base).origin;
   }
@@ -104,9 +111,14 @@ export async function api(
   });
   absorb(jar, response.headers.getSetCookie());
   const text = await response.text();
+  const json = text ? JSON.parse(text) : null;
+  const userId = json && typeof json === 'object' && json.user && typeof json.user.id === 'string' ? json.user.id : '';
+  if (userId) {
+    jar.userId = userId;
+  }
   return {
     status: response.status,
-    json: text ? JSON.parse(text) : null,
+    json,
     replayed: response.headers.get('idempotency-replayed') === 'true',
     setCookie: response.headers.getSetCookie(),
     retryAfter: response.headers.get('retry-after'),

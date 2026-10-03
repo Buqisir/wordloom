@@ -115,6 +115,13 @@ CREATE TABLE idempotency_keys (
   PRIMARY KEY (user_id, key)
 );
 
+CREATE TABLE schedule_generation (
+  user_id TEXT NOT NULL REFERENCES users(id),
+  card_id TEXT NOT NULL,
+  high_water INTEGER NOT NULL CHECK (high_water >= 1),
+  PRIMARY KEY (user_id, card_id)
+);
+
 CREATE INDEX idx_sessions_user ON sessions(user_id);
 CREATE INDEX idx_senses_user ON word_senses(user_id, created_at);
 CREATE INDEX idx_occurrences_sense ON source_occurrences(user_id, sense_id);
@@ -134,13 +141,34 @@ export function openDatabase(path: string): DatabaseSync {
 
 function migrate(db: DatabaseSync): void {
   db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER NOT NULL)');
-  const row = db.prepare('SELECT version FROM schema_migrations').get() as { version: number } | undefined;
-  if (!row) {
-    db.exec(SCHEMA);
-    db.prepare('INSERT INTO schema_migrations (version) VALUES (1)').run();
-  } else if (row.version !== 1) {
-    throw new Error(`Unsupported wordloom schema version ${row.version}.`);
-  }
+  // Version is read inside the write lock so a second opener cannot repeat a partial backfill.
+  transaction(db, () => {
+    const row = db.prepare('SELECT version FROM schema_migrations').get() as { version: number | bigint } | undefined;
+    const version = row ? Number(row.version) : 0;
+    if (version === 0) {
+      db.exec(SCHEMA);
+      db.prepare('INSERT INTO schema_migrations (version) VALUES (2)').run();
+      return;
+    }
+    if (version === 1) {
+      db.exec(`CREATE TABLE IF NOT EXISTS schedule_generation (
+        user_id TEXT NOT NULL REFERENCES users(id),
+        card_id TEXT NOT NULL,
+        high_water INTEGER NOT NULL CHECK (high_water >= 1),
+        PRIMARY KEY (user_id, card_id)
+      )`);
+      // WHERE keeps SQLite from reading ON CONFLICT as a join against schedules.
+      db.exec(`INSERT INTO schedule_generation (user_id, card_id, high_water)
+        SELECT user_id, card_id, revision FROM schedules WHERE true
+        ON CONFLICT(user_id, card_id) DO UPDATE SET
+          high_water = max(schedule_generation.high_water, excluded.high_water)`);
+      db.prepare('UPDATE schema_migrations SET version = 2').run();
+      return;
+    }
+    if (version !== 2) {
+      throw new Error(`Unsupported wordloom schema version ${version}.`);
+    }
+  });
 }
 
 export function changesOf(result: StatementResultingChanges): number {

@@ -5,6 +5,7 @@ import {
   consumeSetupCsrf,
   issueSetupCsrf,
   loadSession,
+  lockedOwner,
   loginAccount,
   logoutAccount,
   readUser,
@@ -13,9 +14,10 @@ import {
 } from './auth.js';
 import { exportBackup, restoreBackup } from './backup.js';
 import { canonicalJson, sha256 } from './crypto.js';
+import { transaction } from './db.js';
 import { HttpError } from './errors.js';
 import { headerValue, parseCookies, readJson, sendJson, serializeCookie } from './http.js';
-import { createCard, getItem, listEvents, listItems, listQueue, listSenses, reviewCard } from './learning.js';
+import { createCard, getItem, listAccountEvents, listEvents, listItems, listQueue, listSenses, reviewCard } from './learning.js';
 import { warmupPasswordHash } from './passwords.js';
 import {
   assertRateLimit,
@@ -118,6 +120,21 @@ async function handle(db: DatabaseSync, gate: Gate, req: IncomingMessage, res: S
       sendJson(res, 200, { user: readUser(db, session.userId) });
       return;
     }
+    if (method === 'GET' && path === '/api/library') {
+      const expectedOwner = headerValue(req.headers['x-wordloom-owner']);
+      const snapshot = transaction(db, () => {
+        const userId = lockedOwner(db, session.id, expectedOwner, now());
+        return {
+          user: readUser(db, userId),
+          items: listItems(db, userId),
+          queue: listQueue(db, userId, now()),
+          senses: listSenses(db, userId),
+          events: listAccountEvents(db, userId),
+        };
+      });
+      sendJson(res, 200, snapshot);
+      return;
+    }
     if (method === 'GET' && path === '/api/cards') {
       sendJson(res, 200, { items: listItems(db, session.userId) });
       return;
@@ -141,17 +158,18 @@ async function handle(db: DatabaseSync, gate: Gate, req: IncomingMessage, res: S
       const body = await readJson(req);
       const key = assertIdempotencyKey(headerValue(req.headers['idempotency-key']));
       const requestHash = sha256(`${method} ${path}\n${canonicalJson(body)}`);
+      const expectedOwner = headerValue(req.headers['x-wordloom-owner']);
       if (path === '/api/cards') {
-        sendResult(res, createCard(db, now, session.userId, body, key, requestHash));
+        sendResult(res, createCard(db, now, session.id, expectedOwner, body, key, requestHash));
         return;
       }
       if (path === '/api/backup/restore') {
-        sendResult(res, restoreBackup(db, now, session.userId, body, key, requestHash));
+        sendResult(res, restoreBackup(db, now, session.id, expectedOwner, body, key, requestHash));
         return;
       }
       const reviewMatch = CARD_REVIEWS.exec(path);
       if (reviewMatch?.[1]) {
-        sendResult(res, reviewCard(db, now, session.userId, assertUuid(reviewMatch[1], 'card id'), body, key, requestHash));
+        sendResult(res, reviewCard(db, now, session.id, expectedOwner, assertUuid(reviewMatch[1], 'card id'), body, key, requestHash));
         return;
       }
     }
